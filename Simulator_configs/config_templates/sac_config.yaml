@@ -1,0 +1,213 @@
+# ====== Distributed (Learner↔Cross) Parameters ======
+distributed:
+  sac:
+    params_broadcast_every_steps: 256   # SAC parameter broadcast step threshold (>0 enabled, <=0 disabled)
+  bdq:
+    params_broadcast_every_steps: 512  # BDQ parameter broadcast step threshold (>0 enabled, <=0 disabled)
+  learner_idle_timeout_seconds: 480
+  # Training switch: both | sac_only | bdq_only
+  train_mode: sac_only
+
+
+# SAC agent configuration file
+# This file contains all configurable parameters for SAC agent
+
+# ====== Environment Parameters (OHLCV only) ======
+# Note: The following three items are default values. When Learner receives the first experience at runtime,
+# it will use assets/window/feat carried in the experience to override and build the network according to actual shape.
+low_freq_feature_dim: 5    # Default feature dimension. Can be overridden by feat in first experience at runtime
+low_freq_seq_len: 60       # Default window length. Can be overridden by window in first experience at runtime
+num_assets: 4              # Default number of assets (including cash). Can be overridden by assets in first experience at runtime
+
+# ====== Network Architecture Parameters ======
+
+# MLP hidden width and Dropout for policy network
+hidden_dim: 256
+mlp_dropout: 0.1
+
+# CNN configuration
+conv_out_channels: 64
+conv_kernel_size: 1
+pool_kernel_size: 1
+cnn_dropout: 0.2
+
+# LSTM configuration
+lstm_hidden_size: 128
+
+# Cross-asset attention
+attention_num_heads: 8
+
+# Fusion dimension reduction (market/position)
+market_reduce_dim: 256  # Market OHLCV features
+weight_fc_dim: 64  # Position weight features
+
+# Feature weight gating (applies to both Actor and Critic for consistency)
+# Weight ratio of position features relative to market features: 0.1 means position features have only 10% influence of market features
+# Value range [0,1]: 0=completely mask position branch, 1=position and market features have equal weight
+actor_weights_gate: 0.0     # Position feature relative weight: market:position = 1:0.1 = 10:1
+
+# ====== SAC Hyperparameters ======
+gamma: 0.95               # Discount factor
+tau: 0.005                # Soft update coefficient
+alpha: 0.2                # Initial alpha value (used as initial value when auto-tuning)
+auto_alpha: true          # Whether to automatically adjust alpha
+target_entropy: -1.8      # Target entropy; when null, calculated by target_entropy_mode (default K-1, or sqrt_k you set), if set, this value takes priority
+alpha_min: 0.02           # Temperature lower bound, prevents early under-exploration (Dirichlet recommends 0.05~0.1)
+
+# Policy network head outputs Dirichlet concentration parameter α_i for each dimension (obtained via softplus + min_concentration), action either uses mean E[a_i] = α_i / A, or samples from Var[a_i] (stochastic)
+dirichlet_min_concentration: 0.5   # Dirichlet minimum concentration, α_i: i-th dimension concentration parameter, each dimension greater than this value
+                                   # α_i>=this value; A=Σα, A is total concentration, larger A means more "stable".
+                                   # Experience: K=number of assets including cash. If weight fluctuates much in early stage:
+                                   # - Set 0.5 (K=4 corresponds to A≈2), for more stability use 1.0 (A≈4)
+                                   # - After stabilization can reduce to 0.2~0.3 to increase exploration
+                                   # - If inference switches to deterministic (using mean α/Σα), can be slightly lower (e.g. 0.2)
+                                   # Notation (Dirichlet):
+                                   # - α_i: i-th dimension concentration parameter (positive number after network output through softplus)
+                                   # - A = Σ_i α_i: total concentration; mean E[a_i] = α_i / A;
+                                   #   variance Var[a_i] = α_i (A − α_i) / (A^2 (A + 1))
+                                   #   ⇒ larger A means more "smooth" sampling (smaller variance), smaller A means more "sharp" (larger variance)
+                                   # - Action a lies in K-dimensional simplex (each dimension non-negative and sum to 1), K=number of assets (including cash)
+# Target entropy selection: null=disabled (use target_entropy), 'k_minus_1' or 'sqrt_k'; K=number of assets (including cash)
+# Priority: if target_entropy is not null, it takes priority; otherwise calculated by mode
+# Recommendations:
+# - Early unstable: sqrt_k (K=4 → target entropy≈ -2.0, more gentle)
+# - After stabilization: k_minus_1 (K=4 → target entropy= -3.0, stronger exploration)
+target_entropy_mode: sqrt_k
+
+# Sampling smoothing (consistent between training and inference, passed to C++ via TorchScript attributes)
+# eps=0.01, means pulling 1% of action towards uniform distribution, 99%
+sampling_eps: 0.01
+
+# ====== Optimizer Parameters ======
+lr_actor: 0.0001          # Actor learning rate
+lr_critic: 0.0003         # Critic learning rate
+lr_alpha: 0.001          # Alpha learning rate (increase response speed, alpha_grad_term converges to 0 faster)
+
+# ====== Experience Replay Parameters ======
+replay_buffer_size: 100000 # Experience replay buffer size
+batch_size: 64             # Batch size
+prioritized_replay_enabled: true  # Whether to enable prioritized replay (recent dates prioritized, time decay)
+prioritized_replay_half_life_days: 2.0  # Time decay half-life (days)
+prioritized_replay_uniform_mix: 0.1     # Mix ratio with uniform distribution, prevents excessive bias
+
+# ====== Inference and Training Parameters ======
+training_enabled: true     # Whether to enable training (true=inference+learning, false=inference only)
+deterministic_policy: false # Whether to use deterministic policy during inference (true=μ only, false=μ+σ sampling)
+train_frequency: 16         # Train once after collecting how many experiences
+train_steps_per_update: 16  # How many steps to train each time (reduce first, slow down Actor tightening speed)
+min_experiences_before_training: 256  # How many experiences needed before starting training
+entropy_logging_enabled: true  # Whether to log entropy to CSV (action log_prob summary)
+
+
+
+# ====== Reward Scaling (Runtime adaptive, stabilizes relative magnitude of Q and entropy) ======
+# Purpose: Keep |Q| and α·E[-logπ] at same order of magnitude (target 1~3x), avoid Critic explosion/Actor dominated by Q.
+# - During training use r' = clip(r/c, ±reward_clip_value) to participate in TD target calculation.
+# Example: Original reward range is -281 to +232, after scaling is -2.071 to +1.710. If absolute value after scaling exceeds 20, clip to ±20.
+reward_scaling_enabled: true
+# Warmup threshold (number of experiences). Set to 0 for immediate enable; conservative can set to 10000.
+reward_scaler_warmup_experiences: 1000
+# Scale estimation method: std | q95 | iqr (0.7413·IQR). For non-stationary markets recommend q95 or iqr.
+reward_scale_method: q95
+# Runtime EWMA half-life (training steps); larger means slower update.
+# Clipping threshold after scaling, prevents extreme noise.
+reward_clip_value: 20.0
+# Minimum lower bound of c, prevents numerical instability.
+reward_min_c: 1.0e-6
+
+# ====== Device and Others ======
+device: 'auto'            # Computing device, 'auto', 'cpu' or 'cuda'
+seed: 1                # Random seed, null means not set
+
+# ====== Gradient Clipping and Numerical Stability ======
+gradient_clipping:
+  enabled: true
+  early_threshold: 2000
+  middle_threshold: 5000
+  early_clip_norm: 5.0
+  middle_clip_norm: 2.0
+  late_clip_norm: 1.5
+  # Q-value clamping: used to mask extreme TD targets/estimates, stabilize gradients; range should cover common distribution but exclude a few outliers
+  # Tuning recommendations:
+  # - Quantile method: use absolute value quantiles of recent N batches of TD targets y or Q, take clamp=±p95 (if unstable use p90; if frequently hitting boundary, relax to p97/99)
+  # - Reward scale method: if single-step reward≈±R, horizon H≈1/(1-γ), then Q scale≈R×H, clamp≈±(Q×1.2) as starting point
+  # - Statistical method: mean±k·std (k=2~3) or median±3·MAD
+  # Monitoring and adaptation: if target/estimate frequently hits boundary→relax; if gradient oscillates/explodes→tighten; can re-estimate every K steps and smoothly update
+  q_value_clamp_min: -500
+  q_value_clamp_max: 500
+
+# ====== Archival/Replay ======
+history_replay_buffer_days: 10
+
+
+
+# ====== Low-level BDQ Configuration ======
+bdq:
+  # LOB related: consistent with DataFactory's L2 depth; history length from simulation xml or here as default
+  lob_depth: 5           # L2 levels (determines price branches=lob_depth+1), must be consistent with l2depth parameter in xml
+  lob_history_len: 60     # LOB history K
+  ratio_branches: 6        # Number of ratio branch discretizations, default {0,0.2,...,1.0}
+
+  # Network/Optimization
+  lstm_hidden_size: 128
+  # LSTM input dropout (applied to features after each step's convolution), for regularization. Recommend 0.2
+  lstm_input_dropout: 0.2
+  # LSTM output dropout (applied to hidden vector at last timestep), generally set to 0 or small value.
+  lstm_output_dropout: 0.0
+  
+  trade_hidden: 128  # Trading feature encoder hidden layer dimension, dimension after FC of four-element feature vector
+  fused_dim: 256  # Note, this is the output channel number of reinforcement learning MLP, has no direct relationship with lstm_hidden_size and trade_hidden, also needs coordinated modification
+  mlp_dropout: 0.1
+  
+  # Trading feature weight gating (solves problem of policy over-relying on trading state features)
+  # Weight ratio of trading features relative to LOB features: 0.1 means trading features have only 10% influence of LOB features
+  # Value range [0,1]: 0=completely mask trading features, 1=trading and LOB features have equal weight
+  # MI analysis shows policy over-relies on trading state (remaining time, remaining quantity), need to reduce its weight to enhance LOB feature attention
+  trade_gate: 0.2     # Trading feature relative weight: LOB:trading = 1:0.2 = 5:1
+  
+  # DeepLOB-style CNN parameters (all happen inside LOBEncoder)
+  # cnn_pair_filters: number of channels C at each convolution stage; corresponds to @C in 1x2@C, 2x1@C, 1xD@C
+  cnn_pair_filters: 16
+  # cnn_leaky_relu_neg_slope: LeakyReLU negative slope, paper uses 0.01
+  cnn_leaky_relu_neg_slope: 0.01
+  # temporal_kernel: change 4x1 in paper to this value; in your minute-level scenario recommend=2 (if lob is 30s snapshot, 2 corresponds to 1-minute window)
+  temporal_kernel: 2
+  # temporal_repeats: number of temporal convolution repeats. 1=current implementation (only once); 2=consistent with original paper (twice before 1xD, and twice after 1xD)
+  temporal_repeats: 2
+  # inception_enabled: whether to enable Inception multi-scale (fixed as GoogLeNet style: 1x1 parallel with (1x1→3x1), (1x1→5x1), (MaxPool→1x1))
+  inception_enabled: true
+  # inception_out_channels: total number of channels after Inception concatenation (evenly divided among branches), best to be multiple of 4
+  inception_out_channels: 32
+  # inception_pool_time_kernel: pooling time kernel size (stride=1, same padding); default 3
+  inception_pool_time_kernel: 3
+
+  gamma: 0.99
+  tau: 0.005
+  lr: 0.0003
+  batch_size: 64
+  replay_buffer_size: 200000
+  eps_start: 0.2
+  eps_end: 0.01
+  eps_decay_steps: 50000
+  
+  # ====== Device and Others ======
+  seed: 1                 # BDQ-specific random seed (independent of top-level SAC seed)
+  device: 'auto'
+
+  # ====== Training Trigger (same semantics as SAC) ======
+  min_experiences_before_training: 256
+  train_frequency: 20
+  train_steps_per_update: 6
+
+  # ====== Experience Replay Parameters ======
+  history_replay_buffer_days: 10
+  prioritized_replay_enabled: true
+  prioritized_replay_half_life_days: 1.5
+  prioritized_replay_uniform_mix: 0.2
+
+  # ====== Reward Shaping (BDQ terminal continuous/piecewise penalty) ======
+  reward_shaping:
+    enabled: true
+    mode: piecewise   # Options: piecewise | linear, former based on fill rate threshold, latter linear mapping
+    max_penalty: 99.0  # Maximum incomplete negative reward, -99
+    success_filled_threshold: 0.95  # Fill rate≥95% considered success (piecewise mode)

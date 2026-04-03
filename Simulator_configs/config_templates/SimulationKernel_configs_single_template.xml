@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<!-- 
+-->
+<Simulation start="09:00:00" duration="06:00:00" date="20230208">
+    <!-- 
+        time format options:
+        1. time string format: "09:30:00" (recommended, most intuitive)
+        2. market time format: "93000000" (compatible with old format)
+        3. nanosecond timestamp: "34200000000000" (precise but not intuitive)
+        
+        duration can be:
+        1. time string format: "00:01:40" (1 minute 40 seconds)
+        2. pure number: "100000" (100000 nanoseconds)
+    -->
+    <!-- deterministic latency model configuration - only effective for single-threaded simulation -->
+    <LatencyModel type="deterministic" enabled="true">
+        <!-- random seed (used for Simulation's global RNG, affecting the latency model).
+             as long as this node appears, it is fixed to the given value (including 0).
+             when this node does not appear, use the system entropy source (non-deterministic). -->
+        <RandomSeed value="1"/>
+        <!-- base latency default value (unit: nanoseconds) -->
+        <MinLatency default="20000000">
+            <!-- latency between specific Agent pairs has been removed -->
+        </MinLatency>
+        <!-- deterministic model parameters -->
+        <!-- note: here defaultLatency will replace the above MinLatency, the jitter part maxNoiseValue is randomly selected from 0 to maxNoiseValue -->
+        <Deterministic defaultLatency="20000000" addRandomNoise="true" maxNoiseValue="10000000" />
+    </LatencyModel>
+
+    <GlobalAgentConfig>
+        <!-- global random seed, used for initialization of all C++ Agents -->
+        <GlobalSeed value="1"/>
+        <!-- Global fundamental value (cents) -->
+        <GlobalRBar value="2000"/>
+        <!-- deterministic discrete-time true fundamental process r*(t) (simulation time dtSeconds) -->
+        <FundamentalValueModel enabled="true" dtSeconds="60" kappa="1.67e-15" sigmaS="1e-8" shockClampPct="0.05"
+                               checkpointEnabled="true" checkpointDir="data/agent_outputs/Fundamental"/>
+    </GlobalAgentConfig>
+
+    <!-- exchange agent 
+        processingDelay: the delay for processing messages, used for responding and notifying subscribers
+        dealingDelay: the delay for processing orders, used for order matching, controlling the time interval from receiving orders to actual matching
+        dealingDelay is important for subscribing to transaction events based on order id after applying the latency model, as transaction matching may occur before the subscription request due to the latency model
+        the setting of dealingDelay must be greater than the maximum upper limit of the deterministic or random delay set for each agent and exchangeAgent, otherwise the transaction matching will occur before the subscription request
+        priceLimitPct: the price limit percentage (±), for example, 0.1 means ±10%, not configured or 0 means disabled
+        Abides project comparison: dealingDelay is equivalent to Abides project pipeline_delay, processingDelay is equivalent to Abides project computation_delay
+    -->
+    <ExchangeAgent                      
+        name="100001"
+        algorithm="PriceTime"           
+        processingDelay="100"
+        dealingDelay="200"
+        priceLimitPct="0.1"
+        />
+
+    <!-- initial liquidity setup agent 
+        provide initial buy/sell orders to the market at the start of the simulation to solve the cold start problem
+        setupTime: the time offset for sending orders (unit: nanoseconds, relative to the simulation start time)
+        bidPrice/askPrice: the bid/ask price (unit: cents, i.e. price*100), 1000 means 10 yuan, 1021 means 10.21 yuan
+        bidVolume/askVolume: the bid/ask volume of stocks
+        exchange: the target exchange name
+    -->
+    <SetupAgent
+        bidPrice="1998"
+        bidVolume="1000"
+        askPrice="2002"
+        askVolume="1000"
+        />
+
+    <!-- market impact agent
+        used to simulate market impact by executing large transactions at specific time points
+        name: the name of the Agent (optional, if not set, it will be automatically generated as "exchange_name_IMPACT")
+        exchange: the target exchange name (optional, if not set, it will be automatically used the name of the first ExchangeAgent)
+        greed: the greed coefficient/impact strength (0.0-1.0), determining the proportion of impact trading volume relative to the total market liquidity
+               for example, 0.1 means impact 10% of the market liquidity
+        impactTime: the specific time for executing the impact, format as "HH:MM:SS"
+                    for example, "09:30:15" means 9:30:15 AM
+        impactSide: the impact direction, "bid" impact the buyer (place a sell order), "ask" impact the seller (place a buy order)
+    -->
+    <!-- simplified configuration: name and exchange will be automatically set
+    <ImpactAgent
+        greed="0.5"
+        impactTime="09:30:00"
+        impactSide="ask"
+        /> -->
+
+    <!-- multiple impact agent examples - need to explicitly specify name to avoid duplication -->
+    <!-- <ImpactAgent
+        name="market_impact_1"
+        greed="0.5"
+        impactTime="09:30:00"
+        impactSide="ask"
+        />
+    <ImpactAgent
+        name="market_impact_2"
+        greed="0.5"
+        impactTime="14:00:00"
+        impactSide="ask"
+        /> -->
+
+    <!-- market replay agent -->
+    <!-- <MarketReplayAgent
+        /> -->
+
+    <!-- order action log agent -->
+    <OrderActionLogAgent
+        flushImmediately="false"
+        logToConsole="true"
+        outputFile="data/agent_outputs/OrderActionLogAgent/"
+        />
+
+    <CppAgentBatch 
+        name="CPP_AGENT_BATCH"
+        >
+        
+        <NoiseAgents 
+            count="120"
+            startingCashRange="50000,50000"
+            wakeupIntervalRange="60,60"
+            orderSizeRange="50,50"
+            tradeProbabilityRange="0.3,0.7"
+            allowShortSelling="false"
+            persistHoldings="false"
+            initialPositionRange="2500,2500"
+            resetThreshold="0.3"
+            wakeupDistributionMode="Poisson"
+        />
+        <MomentumAgents 
+            count="60"
+            startingCashRange="10000,10000"
+            shortWindowRange="30,30"
+            longWindowRange="50,50"
+            wakeupIntervalRange="120,120"
+            maxWakeupIntervalRange="360,360"
+            orderSizeRange="10,10"
+            initialPositionRange="500,500"
+            allowShortSelling="false"
+            persistHoldings="false"
+            resetThreshold="0.3"
+        />
+        <HeuristicBeliefLearningAgents 
+            count="120"
+            startingCashRange="50000, 50000"
+            sigmaNRange="100,100"
+            kappaRange="1.67e-15,1.67e-15"
+            sigmaSRange="1e-8,1e-8"
+            qMaxRange="50 50"
+            sigmaPvRange="500,500"
+            RMinRange="0.01,0.1"
+            RMaxRange="0.11,0.2"
+            etaRange="1.0,1.0"
+            wakeupIntervalRange="300,600"
+            maxWakeupIntervalRange="7200,7200"
+            orderSizeRange="300,300"
+            LRange="6,6"
+            initialPositionRange="2500, 2500"
+            allowShortSelling="true"
+            persistHoldings="false"
+            resetThreshold="0.3"
+        />
+        <MarketMakerAgents 
+            count="1"
+            startingCashRange="50000,50000"
+            orderSizeRange="300,300"
+            windowSizeRange="2,2"
+            anchorModeRange="2,2"
+            numTicksRange="5,5"
+            wakeupIntervalRange="5,5"
+            maxWakeupIntervalRange="5.0,5.0"
+            useFixedWakeup="true"
+            initialPositionRange="2500,2500"
+            persistHoldings="false"
+            resetThreshold="0.3"
+        />
+        <!-- <TestAgents
+            count="1"
+            startingCashRange="100000,100000"
+            initialPositionRange="1000,1000"
+            testIntervalRange="2.0,2.0"
+            persistHoldings="false"
+            resetThreshold="0.2"
+        /> -->
+        
+    </CppAgentBatch>
+   
+</Simulation>

@@ -1,0 +1,429 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<!-- 
+    distributed template
+    support MPI multi-process distributed architecture
+-->
+<Simulation start="09:00:00" duration="04:00:00" date="20230209">
+    <!-- 
+        time format options:
+        1. time string format: "09:30:00" (recommended, most intuitive)
+        2. market time format: "93000000" (compatible with old format)
+        3. nanosecond timestamp: "34200000000000" (precise but not intuitive)
+        
+        duration can be:
+        1. time string format: "00:01:40" (1 minute 40 seconds)
+        2. pure number: "100000" (100000 nanoseconds)
+    -->
+    <!-- deterministic latency model configuration -->
+    <LatencyModel type="deterministic" enabled="false">
+        <!-- random seed (used for Simulation's global RNG, affecting the latency model).
+             as long as this node appears, it is fixed to the given value (including 0).
+             when this node does not appear, use the system entropy source (non-deterministic). -->
+        <RandomSeed value="1"/>
+        <!-- base latency default value (unit: nanoseconds) -->
+        <MinLatency default="20000000">
+            <!-- latency between specific Agent pairs has been removed -->
+        </MinLatency>
+        <!-- deterministic model parameters -->
+        <Deterministic defaultLatency="20000000" addRandomNoise="true" maxNoiseValue="10000000" />
+    </LatencyModel>
+
+    <!-- MPI distributed configuration -->
+    <MPIConfiguration>
+        <SimulationRank>0</SimulationRank>
+        <AgentRanks>1</AgentRanks>
+        <CrossAgentRanks>6,7,8</CrossAgentRanks>
+        <LearningRanks>9</LearningRanks>
+    </MPIConfiguration>
+
+    <!-- global Agent parameters configuration -->
+    <GlobalAgentConfig>
+        <!-- global random seed, used for initialization of all C++ Agents -->
+        <GlobalSeed value="1"/>
+        
+        <!-- Global fundamental value -->
+        <GlobalRBar value="2000"/>
+        <FundamentalValueModel enabled="true" dtSeconds="60" kappa="1.67e-15" sigmaS="1e-8" shockClampPct="0.05"
+                               checkpointEnabled="true" checkpointDir="data/agent_outputs/Fundamental"/>
+    </GlobalAgentConfig>
+    <!-- communication mode configuration -->
+    <CommunicationConfig>
+        <!-- LBTS polling sleep (microseconds):
+             - LBTSPollIntervalMicrosKernel: kernel-side LBTS thread fallback polling sleep (used when doorbell-adaptive LBTS is disabled / not applicable)
+             - LBTSPollIntervalMicrosAgent: agent-side LBTS thread polling sleep -->
+        <LBTSPollIntervalMicrosKernel>5</LBTSPollIntervalMicrosKernel>
+        <LBTSPollIntervalMicrosAgent>5</LBTSPollIntervalMicrosAgent>
+
+        <!-- doorbell-adaptive LBTS (optional):
+             - EnableAdaptiveLBTS: enable LBTS adaptive waiting (doorbell-based wakeup + short-sleep fallback)
+             - DoorbellShortSleepMicrosKernel: LBTS thread fallback sleep when no doorbell/changes are observed
+             Note: spin/yield-based waiting was removed; tuning is mainly via DoorbellShortSleepMicrosKernel + RMAPollIntervalMicros (receiveWorker polling sleep). -->
+        <EnableAdaptiveLBTS>false</EnableAdaptiveLBTS>
+        <DoorbellShortSleepMicrosKernel>5</DoorbellShortSleepMicrosKernel>
+
+        <!-- kernel-to-kernel LBTS lookahead (nanoseconds).
+             This parameter provides a fixed positive lookahead between simulation kernels,
+             with a magnitude similar to kernel-to-agent RouterDelayConfig BaseLookaheadNs. -->
+        <Kernel2KernelLookaheadNs>20000000</Kernel2KernelLookaheadNs>
+
+        <!-- RMA window size uses an asymmetric design:
+             - KernelRMAWindowMB: window size of the simulation Kernel rank (larger, to hold one-sided messages from all distributed agent ranks since one kernel talks to many agents).
+             - AgentRMAWindowMB: window size of an Agent rank (usually smaller, only holds Kernel→Agent slices). -->
+        <KernelRMAWindowMB>128</KernelRMAWindowMB>
+        <AgentRMAWindowMB>64</AgentRMAWindowMB>
+        <!-- RMA polling sleep time (microseconds), default 5. The smaller the polling frequency, the higher the CPU usage, and the lower the delay. -->
+        <RMAPollIntervalMicros>5</RMAPollIntervalMicros>
+        <!-- RMA send backoff upper limit (microseconds). After reaching the upper limit, continue to wait at a fixed interval until there is an empty position. Default 200. -->
+        <RMAPutBackoffMicrosMax>200</RMAPutBackoffMicrosMax>
+        <!-- Whether to enable the lock_all mode of RMA (default false). After enabling, use lock_all instead of per-message per-target lock to improve concurrency throughput. -->
+        <RMALockAll>true</RMALockAll>
+        <!-- debug/statistics log configuration items -->
+        <!-- safe step (LBTS) statistics log:
+             - EnableLBTSLogKernel: enable kernel-side LBTS timestamp log (LBTSLogKernel_rankX.csv); false disables
+             - LBTSLogEveryItersKernel: output one line every N kernel LBTS updates (for example, N=1000 → one line every 1000 updates)
+             - EnableLBTSLogAgent: enable agent-side LBTS timestamp log (LBTSLogAgent_rankX.csv); false disables
+             - LBTSLogEveryItersAgent: output one line every N agent LBTS updates -->
+        <EnableLBTSLogKernel>false</EnableLBTSLogKernel>
+        <LBTSLogEveryItersKernel>5000</LBTSLogEveryItersKernel>
+        <!-- Agent side LBTS log for candidate time reporting: ts1/ts2/ts3 + inflight_count -->
+        <EnableLBTSLogAgent>false</EnableLBTSLogAgent>
+        <LBTSLogEveryItersAgent>2000</LBTSLogEveryItersAgent>
+        <!-- RMA statistics log: in RMA mode, statistics the related messages, such as whether the target window is full of backoff, and the time duration of backoff, etc.
+            - EnableRMAStats: whether to enable RMA statistics; false closes
+            - RMAStatsFlushIntervalMs: RMA statistics output cycle (milliseconds), if set to 1000, output once every 1000ms-->
+        <EnableRMAStats>false</EnableRMAStats>
+        <RMAStatsFlushIntervalMs>5000</RMAStatsFlushIntervalMs>
+        
+        <!-- Communication profiling switch (paper-grade):
+             - true: enable MPI API-level profiling (thread-safe, supports MPI_THREAD_MULTIPLE)
+                     output: communication_logs/mpi_api_profile_rank*.csv (per epoch overwrite; archived by existing log snapshot)
+             - false: profiling disabled (no allocations, no statistics recorded) -->
+        <EnableCommunicationTimeStats>false</EnableCommunicationTimeStats>
+
+        <!-- Aligned message time-shift statistics (kernel/agent side controls):
+             - EnableAlignedMessageStatsKernel: enable kernel-side aligned message stats (alignment distribution and per-type ratio);
+             - EnableAlignedMessageStatsAgent: enable agent-side aligned message stats. -->
+        <EnableAlignedMessageStatsKernel>false</EnableAlignedMessageStatsKernel>
+        <EnableAlignedMessageStatsAgent>false</EnableAlignedMessageStatsAgent>
+
+        <!-- Whether WAKEUP (0-delay control message) participates in LBTS:
+             - true: WAKEUP participates in LBTS as a no-delay message (MUST NOT be treated as +BaseLookaheadNs)
+             - false: WAKEUP does not participate in LBTS (may increase kernel-side alignment) -->
+        <TrackWakeupInLBTS>true</TrackWakeupInLBTS>
+
+        <!-- load statistics: only record and output when enabled, otherwise do not record and output -->
+        <!-- EnableCPULoadStats: whether to enable CPU load statistics; false closes -->
+        <!-- EnableMessageStats: whether to enable message statistics (agent router queue and distribution statistics); false closes -->
+        <!-- RankStatsFlushIntervalMs simultaneously configures the output cycle of CPU and message statistics, which can be configured separately -->
+        <EnableCPULoadStats>false</EnableCPULoadStats>
+        <EnableMessageStats>false</EnableMessageStats>
+        <RankStatsFlushIntervalMs>5000</RankStatsFlushIntervalMs>
+    </CommunicationConfig>
+
+    <!-- Rank 0: simulation kernel + exchange + system Agent -->
+    <CoreRank rank="0">
+        <!-- Router level outbound delay model (used for PDES lookahead injection on the Kernel side): arrival += base + jitter -->
+        <!-- Note: when Enable is false, only RandomNoise is invalid, baseLookaheadNs still takes effect to ensure that the kernel normally advances according to LVT+Lookahead 
+        but if the Agent rank side sets Enable to false, then baseLookaheadNs and RandomNoise are both invalid. -->
+        <RouterDelayConfig>
+            <Enable>true</Enable>
+            <BaseLookaheadNs>20000000</BaseLookaheadNs>
+            <RandomNoise>
+                <defaultLatency>0</defaultLatency>
+                <addRandomNoise>true</addRandomNoise>
+                <maxNoiseValue>10000000</maxNoiseValue>
+            </RandomNoise>
+        </RouterDelayConfig>
+        <!-- exchange agent
+            processingDelay: the delay for processing messages, used for responding and notifying subscribers
+            dealingDelay: the delay for processing orders, used for order matching, controlling the time interval from receiving orders to actual matching
+            priceLimitPct: the price limit percentage (±), for example, 0.1 means ±10%, not configured or 0 means disabled
+        -->
+        <ExchangeAgent                      
+            name="100001"
+            algorithm="PriceTime"
+            processingDelay="100"
+            dealingDelay="200"
+            priceLimitPct="0.3"  
+            />
+
+        <!-- initial liquidity setup agent -->
+        <SetupAgent
+            name="SETUP_AGENT"
+            bidPrice="1998"
+            bidVolume="1000"
+            askPrice="2002"
+            askVolume="1000"
+            />
+            
+        <!-- order action log agent -->
+        <OrderActionLogAgent
+            name="ORDER_LOG_AGENT"
+            flushImmediately="false"
+            logToConsole="true"
+            outputFile="/home/sun/Projects/DESMAR/data/agent_outputs/OrderActionLogAgent/"
+            />
+
+        <!-- simple single impact agent example - need to explicitly specify name to avoid duplication -->
+        <!-- <ImpactAgent
+            greed="0.5"
+            impactTime="09:30:00"
+            impactSide="ask"
+            /> -->
+
+        <!-- multiple impact agent examples - need to explicitly specify name to avoid duplication -->
+        <!-- <ImpactAgent
+            name="market_impact_1"
+            greed="0.5"
+            impactTime="09:30:00"
+            impactSide="ask"
+            />
+        <ImpactAgent
+            name="market_impact_2"
+            greed="0.5"
+            impactTime="14:00:00"
+            impactSide="ask"
+            /> -->
+
+        <!-- market replay agent -->
+        <!-- <MarketReplayAgent
+        /> -->
+
+        <!-- Kernel-rank local C++ agents (run on SimulationRank, not on AgentRank processes) -->
+        <!-- <CppAgentBatch name="CPP_AGENT_BATCH_KERNEL">
+            <NoiseAgents 
+                count="100"
+                startingCashRange="50000,50000"
+                wakeupIntervalRange="60,60"
+                orderSizeRange="100,100"
+                tradeProbabilityRange="0.3,0.7"
+                allowShortSelling="false"
+                persistHoldings="true"
+                initialPositionRange="2500,2500"
+                resetThreshold="0.3"
+                wakeupDistributionMode="Poisson"
+            />
+           <MarketMakerAgents 
+                count="1"
+                startingCashRange="50000,50000"
+                orderSizeRange="500,500"
+                windowSizeRange="2,2"
+                anchorModeRange="2,2"
+                numTicksRange="5,5"
+                wakeupIntervalRange="5,5"
+                maxWakeupIntervalRange="5.0,5.0"
+                seFixedWakeup="true"
+                initialPositionRange="2500,2500"
+                persistHoldings="true"
+                resetThreshold="0.3"
+            />
+        </CppAgentBatch> -->
+
+    </CoreRank>
+    <CrossAgentRank rank="6" routerName="CROSS_RANK_1">
+        <RouterDelayConfig>
+            <Enable>true</Enable>
+            <BaseLookaheadNs>20000000</BaseLookaheadNs>
+            <RandomNoise>
+                <defaultLatency>0</defaultLatency>
+                <addRandomNoise>true</addRandomNoise>
+                <maxNoiseValue>10000000</maxNoiseValue>
+            </RandomNoise>
+        </RouterDelayConfig>
+        <ExperienceBatchConfig expBatchMin="20" expBatchTimeoutMs="50"/>
+        <DataFactoryAgents
+            count="1"
+            startIndex="1"
+            wakeupIntervalSeconds="5.0"
+            l2Depth="5"
+            ohlcvMinutes="1"
+            lobMultiple="6"
+        />
+        <CrossRLAgents
+            count="15"
+            startIndex="1"
+            wakeupIntervalSeconds="900.0"
+            wakeupDistributionMode="Uniform"
+            uniformWakeupPerturbSeconds="180.0"
+            maxWakeupIntervalSeconds="1800.0"
+            ohlcvHistoryWindow="60"
+            lobHistoryWindow="60"
+            startingCash="14000"
+            initialPosition="600"
+            persistHoldings="true"
+            resetThreshold="0.1"
+            deterministicInference="false"
+            rewardWakeMultiplier="1"
+            hierarchicalDecision="false"
+            tradeTimesBetweenWakeup="5"
+            commissionLambda="0.002"
+            bdqSaveExecutionStats="false"
+        />
+    </CrossAgentRank>
+    <CrossAgentRank rank="7" routerName="CROSS_RANK_2">
+        <RouterDelayConfig>
+            <Enable>true</Enable>
+            <BaseLookaheadNs>20000000</BaseLookaheadNs>
+            <RandomNoise>
+                <defaultLatency>0</defaultLatency>
+                <addRandomNoise>true</addRandomNoise>
+                <maxNoiseValue>10000000</maxNoiseValue>
+            </RandomNoise>
+        </RouterDelayConfig>
+        <ExperienceBatchConfig expBatchMin="20" expBatchTimeoutMs="50"/>
+        <DataFactoryAgents
+            count="1"
+            startIndex="2"
+            wakeupIntervalSeconds="5.0"
+            l2Depth="5"
+            ohlcvMinutes="1"
+            lobMultiple="6"
+        />
+        <CrossRLAgents
+            count="15"
+            startIndex="16"
+            wakeupIntervalSeconds="900.0"
+            wakeupDistributionMode="Uniform"
+            uniformWakeupPerturbSeconds="180.0"
+            maxWakeupIntervalSeconds="1800.0"
+            ohlcvHistoryWindow="60"
+            lobHistoryWindow="60"
+            startingCash="14000"
+            initialPosition="600"
+            persistHoldings="true"
+            resetThreshold="0.1"
+            deterministicInference="false"
+            rewardWakeMultiplier="1"
+            hierarchicalDecision="false"
+            tradeTimesBetweenWakeup="5"
+            commissionLambda="0.002"
+            bdqSaveExecutionStats="false"
+        />
+    </CrossAgentRank>
+    <CrossAgentRank rank="8" routerName="CROSS_RANK_3">
+        <RouterDelayConfig>
+            <Enable>true</Enable>
+            <BaseLookaheadNs>20000000</BaseLookaheadNs>
+            <RandomNoise>
+                <defaultLatency>0</defaultLatency>
+                <addRandomNoise>true</addRandomNoise>
+                <maxNoiseValue>10000000</maxNoiseValue>
+            </RandomNoise>
+        </RouterDelayConfig>
+        <ExperienceBatchConfig expBatchMin="20" expBatchTimeoutMs="50"/>
+        <DataFactoryAgents
+            count="1"
+            startIndex="3"
+            wakeupIntervalSeconds="5.0"
+            l2Depth="5"
+            ohlcvMinutes="1"
+            lobMultiple="6"
+        />
+        <CrossRLAgents
+            count="15"
+            startIndex="31"
+            wakeupIntervalSeconds="900.0"
+            wakeupDistributionMode="Uniform"
+            uniformWakeupPerturbSeconds="180.0"
+            maxWakeupIntervalSeconds="1800.0"
+            ohlcvHistoryWindow="60"
+            lobHistoryWindow="60"
+            startingCash="14000"
+            initialPosition="600"
+            persistHoldings="true"
+            resetThreshold="0.1"
+            deterministicInference="false"
+            rewardWakeMultiplier="1"
+            hierarchicalDecision="false"
+            tradeTimesBetweenWakeup="5"
+            commissionLambda="0.002"
+            bdqSaveExecutionStats="false"
+        />
+    </CrossAgentRank>
+
+    
+    <MultiKernel targets="0:100001;2:100002;4:100003">
+        <Kernel rank="0" agentRanks="1" crossAgentRanks="6,7,8" kernelWindowMB="128"/>
+        <Kernel rank="2" agentRanks="3" crossAgentRanks="6,7,8" kernelWindowMB="128"/>
+        <Kernel rank="4" agentRanks="5" crossAgentRanks="6,7,8" kernelWindowMB="128"/>
+    </MultiKernel>
+
+    
+    <!-- Rank 1: 1st group of trading agents -->
+    <AgentRank rank="1" routerName="ROUTER_RANK_1">
+        <RouterDelayConfig>
+            <Enable>true</Enable>
+            <BaseLookaheadNs>20000000</BaseLookaheadNs>
+            <RandomNoise>
+                <defaultLatency>0</defaultLatency>
+                <addRandomNoise>true</addRandomNoise>
+                <maxNoiseValue>10000000</maxNoiseValue>
+            </RandomNoise>
+        </RouterDelayConfig>
+        <NoiseAgents 
+            count="48"
+            startIndex="1"
+            startingCashRange="50000,50000"
+            wakeupIntervalRange="60,60"
+            orderSizeRange="50,50"
+            tradeProbabilityRange="0.3,0.7"
+            allowShortSelling="false"
+            persistHoldings="false"
+            initialPositionRange="2500,2500"
+            resetThreshold="0.3"
+            wakeupDistributionMode="Poisson"
+        />
+        <MomentumAgents 
+            count="24"
+            startIndex="1"
+            startingCashRange="10000,10000"
+            shortWindowRange="30,30"
+            longWindowRange="50,50"
+            wakeupIntervalRange="120,120"
+            maxWakeupIntervalRange="3600,3600"
+            orderSizeRange="10,10"
+            initialPositionRange="500,500"
+            allowShortSelling="false"
+            persistHoldings="false"
+            resetThreshold="0.3"
+        />
+        <HeuristicBeliefLearningAgents 
+            count="48"
+            startIndex="1"
+            startingCashRange="50000, 50000"
+            sigmaNRange="100,100"
+            kappaRange="1.67e-15,1.67e-15"
+            sigmaSRange="1e-8,1e-8"
+            qMaxRange="50 50"
+            sigmaPvRange="500,500"
+            RMinRange="0.01,0.1"
+            RMaxRange="0.11,0.2"
+            etaRange="1.0,1.0"
+            wakeupIntervalRange="300,600"
+            maxWakeupIntervalRange="7200,7200"
+            orderSizeRange="300,300"
+            LRange="6,6"
+            initialPositionRange="2500, 2500"
+            allowShortSelling="true"
+            persistHoldings="false"
+            resetThreshold="0.3"
+        />
+        <MarketMakerAgents 
+            count="1"
+            startIndex="1"
+            startingCashRange="50000,50000"
+            orderSizeRange="300,300"
+            windowSizeRange="2,2"
+            anchorModeRange="2,2"
+            numTicksRange="5,5"
+            wakeupIntervalRange="5,5"
+            maxWakeupIntervalRange="5.0,5.0"
+            useFixedWakeup="false"
+            initialPositionRange="2500,2500"
+            persistHoldings="false"
+            resetThreshold="0.3"
+        />
+    </AgentRank>
+
+
+</Simulation>
