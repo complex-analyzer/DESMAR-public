@@ -23,12 +23,14 @@
 class MessageRouter {
 private:
     std::shared_ptr<AgentRankRegistry> m_registry;
+    std::set<int> m_broadcastTargetRanks;
     
 public:
     MessageRouter(std::shared_ptr<AgentRankRegistry> registry) : m_registry(registry) {}
     
     RoutingDecision routeMessage(const MessagePtr& msg);
     std::set<int> getAllAgentRanks() const;
+    void setBroadcastTargetRanks(const std::vector<int>& ranks);
 };
 
 class DistributedSimulation : public Simulation {
@@ -71,6 +73,7 @@ private:
     std::atomic<Timestamp> m_lastEnqueuedArrival{0};
 
     RouterDelayModel m_kernelDelay;
+    bool m_trackWakeupInLBTS{true};
     // Explicit kernel-to-kernel lookahead (nanoseconds in Timestamp units).
     // If zero, fall back to m_kernelDelay.base().
     Timestamp m_kernel2KernelLookahead{0};
@@ -86,7 +89,8 @@ private:
     std::atomic<bool> m_lbtsThreadRunning{false};
     std::thread m_lbtsThread;
     unsigned int m_lbtsPollIntervalMicrosKernel{100};
-    bool m_enableAdaptiveLBTS{true};
+    bool m_enableMainMessageDoorbell{false};
+    bool m_enableSyncDoorbell{true};
     std::atomic<bool> m_lbtsQuiesce{false};
     bool m_debugLBTS{true};
     unsigned int m_lbtsLogEveryIters{1};
@@ -96,7 +100,8 @@ private:
     std::atomic<uint32_t> m_kernelEpoch{1};  // Must be >= 1, epoch 0 means "not yet published"
     bool m_enableInterKernelSync{true};
 
-    unsigned int m_doorbellShortSleepMicros{1};
+    unsigned int m_mainDoorbellShortSleepMicros{1};
+    unsigned int m_syncDoorbellShortSleepMicros{1};
 
     struct LBTSCounters {
         std::atomic<uint64_t> iters{0};
@@ -177,12 +182,14 @@ public:
 
     void setKernelRanks(const std::vector<int>& ranks) { m_kernelRanks = ranks; }
     void setInterKernelSyncEnabled(bool enabled) { m_enableInterKernelSync = enabled; }
+    void setBroadcastTargetRanks(const std::vector<int>& ranks);
 
     std::atomic<int> m_stopAckReceived{0};
     int m_expectedStopAcks{0};
     std::atomic<bool> m_stopPhaseStarted{false};
     std::mutex m_stopAckMutex;
     std::unordered_set<int> m_stopAckedRanks;
+    std::unordered_set<int> m_expectedStopAckRanks;
 
     // Dump kernel-side time alignment statistics (if enabled) to a text file.
     void dumpTimeAlignmentStats(const std::string& filename) const;

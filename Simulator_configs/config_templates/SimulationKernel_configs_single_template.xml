@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no" ?>
 <!-- 
 -->
-<Simulation start="09:00:00" duration="06:00:00" date="20230208">
+<Simulation start="09:00:00" duration="02:00:00" date="20230209">
     <!-- 
         time format options:
         1. time string format: "09:30:00" (recommended, most intuitive)
@@ -13,7 +13,7 @@
         2. pure number: "100000" (100000 nanoseconds)
     -->
     <!-- deterministic latency model configuration - only effective for single-threaded simulation -->
-    <LatencyModel type="deterministic" enabled="true">
+    <LatencyModel type="deterministic" enabled="false">
         <!-- random seed (used for Simulation's global RNG, affecting the latency model).
              as long as this node appears, it is fixed to the given value (including 0).
              when this node does not appear, use the system entropy source (non-deterministic). -->

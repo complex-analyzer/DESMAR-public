@@ -1,5 +1,6 @@
 #include "CppCrossDataFactoryAgent.h"
 #include "Simulation.h"
+#include "AgentRankRouter.h"
 #include "DateTimeConverter.h"
 #include <iostream>
 #include <fstream>
@@ -9,6 +10,9 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <limits>
+#include <unordered_set>
 
 namespace {
 static inline std::filesystem::path dataFactoryMergedDir() {
@@ -35,6 +39,8 @@ CppCrossDataFactoryAgent::CppCrossDataFactoryAgent(
     m_round.target_wakeup_ts = 0;
     m_wakeup_interval_seconds = wakeup_interval_seconds;
     m_l2_depth = l2_depth;
+    m_scheduler_seed = seed;
+    syncWakeupSchedulerConfig();
 }
 
 void CppCrossDataFactoryAgent::configure(const pugi::xml_node& node, const std::string& configurationPath) {
@@ -55,6 +61,7 @@ void CppCrossDataFactoryAgent::configure(const pugi::xml_node& node, const std::
             if (v > 0) m_lob_multiple = v;
         }
     }
+    syncWakeupSchedulerConfig();
 }
 
 void CppCrossDataFactoryAgent::setEpochDate(const std::string& yyyymmdd) {
@@ -127,12 +134,14 @@ void CppCrossDataFactoryAgent::preload() {
 
 void CppCrossDataFactoryAgent::handleSimulationStart() {
     if (m_round.index == 0) {
+        m_wakeup_scheduler.clear();
         m_round.index = 1;
         m_round.in_progress = true;
         rebuildKernelsFromAssetMap();
         m_round.ops_total = static_cast<int>(m_kernels.size());
         m_round.ops_done = 0;
         m_round.target_wakeup_ts = 0;
+        m_current_step_round_index = -1;
         // std::cout << "[DataFactory] Start Round " << m_round.index
         //           << " kernels=" << m_round.ops_total << std::endl;
         subscribeAllAssetsTradeEvents();
@@ -156,8 +165,6 @@ void CppCrossDataFactoryAgent::handleSimulationStop() {
     std::cout << "[DataFactory] " << name() << " received STOP, starting graceful shutdown" << std::endl;
     
     try { processAndPersistOhlcvIfNeeded(); } catch (...) {}
-    try { flushOpenOhlcvBarsToDisk(); } catch (...) {}
-    try { flushPendingLobToDisk(); } catch (...) {}
     
     CppCrossTradingAgent::handleSimulationStop();
     
@@ -169,8 +176,8 @@ void CppCrossDataFactoryAgent::handleSimulationStop() {
                   << " last_target_wakeup_ts=" << m_round.target_wakeup_ts
                   << std::endl;
 
-        for (const auto& kv : m_asset_to_kernel) {
-            const std::string& asset = kv.first;
+        const auto connectedAssets = connectedAssetsForLocalTopology();
+        for (const auto& asset : connectedAssets) {
             const auto itT = m_trades_by_asset.find(asset);
             size_t tradeCount = (itT != m_trades_by_asset.end()) ? itT->second.size() : 0u;
             std::cout << "  [Asset] " << asset << " trades_count=" << tradeCount;
@@ -218,6 +225,13 @@ void CppCrossDataFactoryAgent::handleSimulationStop() {
     }
 }
 
+void CppCrossDataFactoryAgent::onFinalDrainCompleted() {
+    std::cout << "[DataFactory] " << name() << " final drain completed, flushing data" << std::endl;
+    try { processAndPersistOhlcvIfNeeded(); } catch (...) {}
+    try { flushOpenOhlcvBarsToDisk(); } catch (...) {}
+    try { flushPendingLobToDisk(); } catch (...) {}
+}
+
 void CppCrossDataFactoryAgent::receiveMessage(const MessagePtr& msg) {
     if (!msg) return;
     CppTradingAgent::updateCurrentTimeFromMessage(msg);
@@ -225,6 +239,12 @@ void CppCrossDataFactoryAgent::receiveMessage(const MessagePtr& msg) {
         if (auto gp = dynamic_cast<const GenericPayload*>(msg->payload.get())) {
             auto it = gp->find("kernel");
             if (it != gp->end()) { try { m_current_kernel = std::stoi(it->second); } catch (...) {} }
+            auto itRound = gp->find("round_index");
+            if (itRound != gp->end()) {
+                try { m_current_step_round_index = std::stoi(itRound->second); } catch (...) { m_current_step_round_index = -1; }
+            } else {
+                m_current_step_round_index = -1;
+            }
         }
     }
     if (msg->type == "EVENT_SIMULATION_START" && msg->payload) {
@@ -254,16 +274,45 @@ void CppCrossDataFactoryAgent::receiveMessage(const MessagePtr& msg) {
 }
 
 void CppCrossDataFactoryAgent::handleWakeup() {
-    if (!m_round.in_progress) {
-        m_round.index += 1;
-        m_round.in_progress = true;
-        m_round.ops_total = static_cast<int>(m_kernels.size());
-        m_round.ops_done = 0;
-        m_round.target_wakeup_ts = 0;
-        // std::cout << "[DataFactory] Start Round " << m_round.index
-        //           << " kernels=" << m_round.ops_total << std::endl;
+    Timestamp ts = getCurrentTime();
+    CrossWakeupScheduler::StepKey key;
+    key.round_index = (m_current_step_round_index > 0 ? m_current_step_round_index : 0);
+    key.intra = false;
+    key.intra_index = 0;
+
+    auto result = m_wakeup_scheduler.onWakeup(ts, key, m_current_kernel);
+    if (result.type == CrossWakeupScheduler::WakeupResultType::UnknownStep) {
+        return;
     }
+
     processWakeForCurrentKernel();
+
+    if (result.type != CrossWakeupScheduler::WakeupResultType::StepJustCompleted) {
+        return;
+    }
+
+    const auto& step = result.state;
+    m_round.index = step.key.round_index;
+    m_round.in_progress = true;
+    m_round.ops_total = static_cast<int>(step.kernels_expected.size());
+    m_round.ops_done = static_cast<int>(step.kernels_arrived.size());
+    m_round.target_wakeup_ts = step.ts;
+
+    try {
+        processAndPersistOhlcvIfNeeded();
+    } catch (const std::exception& e) {
+        std::cerr << "[DataFactory][OHLCV][Process] error: " << e.what() << std::endl;
+    }
+    try {
+        m_lob_round_index += 1;
+        processAndPersistLobIfNeeded();
+    } catch (const std::exception& e) {
+        std::cerr << "[DataFactory][LOB][Process] error: " << e.what() << std::endl;
+    }
+    m_round.in_progress = false;
+
+    Timestamp now = getCurrentTime();
+    scheduleNextWakeupRound(step.ts, now, m_round.index);
 }
 
 void CppCrossDataFactoryAgent::processStartForCurrentKernel() {
@@ -271,12 +320,12 @@ void CppCrossDataFactoryAgent::processStartForCurrentKernel() {
     for (const auto& asset : assets) {
         retrieveL2For(asset, m_l2_depth);
     }
-    scheduleNextWakeupForCurrentKernelWithRoundTarget();
 
     m_round.ops_done += 1;
     if (m_round.ops_done >= m_round.ops_total) {
         m_round.in_progress = false;
-        // std::cout << "[DataFactory] Finish Round " << m_round.index << std::endl;
+        Timestamp now = getCurrentTime();
+        scheduleNextWakeupRound(now, now, m_round.index);
     }
 }
 
@@ -285,66 +334,6 @@ void CppCrossDataFactoryAgent::processWakeForCurrentKernel() {
     for (const auto& asset : assets) {
         retrieveL2For(asset, m_l2_depth);
     }
-    scheduleNextWakeupForCurrentKernelWithRoundTarget();
-
-    m_round.ops_done += 1;
-    if (m_round.ops_done >= m_round.ops_total) {
-        try {
-            processAndPersistOhlcvIfNeeded();
-        } catch (const std::exception& e) {
-            std::cerr << "[DataFactory][OHLCV][Process] error: " << e.what() << std::endl;
-        }
-        try {
-            m_lob_round_index += 1;
-            processAndPersistLobIfNeeded();
-        } catch (const std::exception& e) {
-            std::cerr << "[DataFactory][LOB][Process] error: " << e.what() << std::endl;
-        }
-        m_round.in_progress = false;
-    }
-}
-
-void CppCrossDataFactoryAgent::scheduleNextWakeupForCurrentKernelWithRoundTarget() {
-    if (m_round.ops_total <= 0) return;
-    if (m_round.in_progress && m_round.ops_done == 0) {
-        establishRoundTargetWakeupTimestamp();
-    }
-    if (m_round.target_wakeup_ts > 0) {
-        Timestamp now = getCurrentTime();
-        Timestamp delay = (m_round.target_wakeup_ts > now) ? (m_round.target_wakeup_ts - now) : 0;
-        std::map<std::string, std::string> payload;
-        payload["kernel"] = std::to_string(m_current_kernel);
-        const_cast<Simulation*>(simulation())->dispatchGenericMessage(
-            now,
-            delay,
-            name(),
-            name(),
-            "WAKEUP",
-            payload
-        );
-        // std::cout << "[DataFactory][ScheduleWake] round=" << m_round.index
-        //           << " kernel=" << m_current_kernel
-        //           << " now=" << now
-        //           << " target_ts=" << m_round.target_wakeup_ts
-        //           << " delay_ns=" << delay
-        //           << std::endl;
-    }
-}
-
-void CppCrossDataFactoryAgent::establishRoundTargetWakeupTimestamp() {
-    m_round.target_wakeup_ts = calcNextRoundTargetTimestamp();
-    // std::cout << "[DataFactory][RoundTarget] round=" << m_round.index
-    //           << " target_ts=" << m_round.target_wakeup_ts
-    //           << " interval_s=" << m_wakeup_interval_seconds
-    //           << std::endl;
-}
-
-Timestamp CppCrossDataFactoryAgent::calcNextRoundTargetTimestamp() const {
-    Timestamp now = getCurrentTime();
-    double dt_sec = m_wakeup_interval_seconds;
-    if (dt_sec < 0) dt_sec = 0;
-    Timestamp delta = static_cast<Timestamp>(dt_sec * 1e9);
-    return now + delta;
 }
 
 void CppCrossDataFactoryAgent::rebuildKernelsFromAssetMap() {
@@ -352,6 +341,92 @@ void CppCrossDataFactoryAgent::rebuildKernelsFromAssetMap() {
     for (const auto& kv : m_asset_to_kernel) {
         m_kernels.insert(kv.second);
     }
+}
+
+void CppCrossDataFactoryAgent::syncWakeupSchedulerConfig() {
+    CrossWakeupScheduler::Config cfg;
+    cfg.wakeup_interval_seconds = m_wakeup_interval_seconds;
+    cfg.max_wakeup_interval_seconds = 0.0;
+    cfg.uniform_perturb_seconds = 0.0;
+    cfg.trade_times_between_wakeup = 1;
+    cfg.hierarchical_decision = false;
+    cfg.mode = CrossWakeupScheduler::Config::DistributionMode::Uniform;
+    m_wakeup_scheduler.setConfig(cfg);
+    m_wakeup_scheduler.setSeed(m_scheduler_seed);
+}
+
+void CppCrossDataFactoryAgent::scheduleNextWakeupRound(Timestamp scheduleBase, Timestamp dispatchNow, int currentRoundIndex) {
+    if (m_kernels.empty()) return;
+    Timestamp interval = static_cast<Timestamp>(m_wakeup_interval_seconds * 1e9);
+    if (interval <= 0) return;
+
+    Timestamp target = (scheduleBase > std::numeric_limits<Timestamp>::max() - interval)
+        ? std::numeric_limits<Timestamp>::max()
+        : scheduleBase + interval;
+    int nextRoundIndex = currentRoundIndex + 1;
+
+    // Keep the DataFactory wakeup cadence on a fixed simulation-time grid.
+    // If CMB/lookahead delays make us miss one or more ticks, skip them instead
+    // of scheduling delay=0 catch-up wakeups that can be aligned by kernels.
+    if (target <= dispatchNow && target != std::numeric_limits<Timestamp>::max()) {
+        Timestamp lag = dispatchNow - target;
+        Timestamp skipped = (lag / interval) + 1;
+        if (skipped > 0) {
+            Timestamp maxSkips = (std::numeric_limits<Timestamp>::max() - target) / interval;
+            if (skipped > maxSkips) {
+                target = std::numeric_limits<Timestamp>::max();
+            } else {
+                target += skipped * interval;
+            }
+            if (skipped <= static_cast<Timestamp>(std::numeric_limits<int>::max() - nextRoundIndex)) {
+                nextRoundIndex += static_cast<int>(skipped);
+            }
+        }
+    }
+
+    auto st = m_wakeup_scheduler.registerHighLevelStep(target, nextRoundIndex, m_kernels);
+    Timestamp delay = (st.ts > dispatchNow) ? (st.ts - dispatchNow) : 0;
+    m_round.target_wakeup_ts = st.ts;
+    for (int k : st.kernels_expected) {
+        std::map<std::string, std::string> payload;
+        payload["kernel"] = std::to_string(k);
+        payload["round_index"] = std::to_string(st.key.round_index);
+        const_cast<Simulation*>(simulation())->dispatchGenericMessage(
+            dispatchNow,
+            delay,
+            name(),
+            name(),
+            "WAKEUP",
+            payload
+        );
+    }
+}
+
+std::vector<std::string> CppCrossDataFactoryAgent::connectedAssetsForLocalTopology() const {
+    if (m_asset_to_kernel.empty()) return {};
+
+    std::unordered_set<int> allowedKernelRanks;
+    if (auto* router = getRouter()) {
+        try {
+            const auto targets = router->getCommunication().getKernelTargetsOrSim();
+            for (int kr : targets) {
+                if (kr >= 0) allowedKernelRanks.insert(kr);
+            }
+        } catch (...) {
+            // Fallback to existing behavior if topology is unavailable.
+        }
+    }
+
+    std::vector<std::string> assets;
+    assets.reserve(m_asset_to_kernel.size());
+    for (const auto& kv : m_asset_to_kernel) {
+        if (allowedKernelRanks.empty() || allowedKernelRanks.count(kv.second) > 0) {
+            assets.push_back(kv.first);
+        }
+    }
+    std::sort(assets.begin(), assets.end());
+    assets.erase(std::unique(assets.begin(), assets.end()), assets.end());
+    return assets;
 }
 
 void CppCrossDataFactoryAgent::handleTradeEventDataFactory(const MessagePtr& msg) {
@@ -374,6 +449,7 @@ void CppCrossDataFactoryAgent::handleTradeEventDataFactory(const MessagePtr& msg
         rec.aggressing_order_id = trade.aggressingOrderID();
         rec.resting_order_id = trade.restingOrderID();
         m_trades_by_asset[asset].push_back(rec);
+        updateOhlcvWithTrade(asset, rec);
     } catch (const std::exception& e) {
         std::cerr << "[DataFactory][TRADE] error: " << e.what() << std::endl;
     }
@@ -575,97 +651,117 @@ void CppCrossDataFactoryAgent::initializeOhlcvFromExistingFiles() {
     }
 }
 
+void CppCrossDataFactoryAgent::fillOhlcvGapsTo(
+    std::vector<OhlcvBar>& bars,
+    Timestamp interval,
+    Timestamp targetBarStartExclusive) const {
+    if (interval <= 0 || targetBarStartExclusive <= 0) return;
+
+    Timestamp lastCur = 0;
+    double lastClose = 0.0;
+    bool haveClose = false;
+    for (auto it = bars.rbegin(); it != bars.rend(); ++it) {
+        if (formatDateYYYYMMDD(it->start_ts) == m_sim_date_yyyymmdd) {
+            lastCur = it->start_ts;
+            lastClose = it->close;
+            haveClose = std::isfinite(lastClose) && lastClose > 0.0;
+            break;
+        }
+        if (formatDateYYYYMMDD(it->start_ts) < m_sim_date_yyyymmdd) break;
+    }
+    if (lastCur <= 0 || !haveClose) return;
+    if (lastCur + interval >= targetBarStartExclusive) return;
+
+    for (Timestamp t = lastCur + interval; t < targetBarStartExclusive; t += interval) {
+        if (formatDateYYYYMMDD(t) != m_sim_date_yyyymmdd) break;
+        OhlcvBar b;
+        b.start_ts = t;
+        b.open = lastClose;
+        b.high = lastClose;
+        b.low = lastClose;
+        b.close = lastClose;
+        b.volume = 0;
+        bars.push_back(b);
+    }
+}
+
+void CppCrossDataFactoryAgent::updateOhlcvWithTrade(const std::string& asset, const TradeRecord& tr) {
+    if (m_sim_date_yyyymmdd.empty()) return;
+    if (m_ohlcv_minutes <= 0) return;
+    if (formatDateYYYYMMDD(tr.timestamp) != m_sim_date_yyyymmdd) return;
+
+    Timestamp interval = intervalNsFromMinutes(m_ohlcv_minutes);
+    if (interval <= 0) return;
+
+    Timestamp barStart = (tr.timestamp / interval) * interval;
+    double price = tr.price_float;
+    unsigned long long vol = static_cast<unsigned long long>(tr.volume);
+    auto& bars = m_ohlcv_by_asset[asset];
+
+    auto applyTradeToBar = [&](OhlcvBar& b) {
+        if (b.volume == 0) {
+            // A zero-volume placeholder may have been created for a quiet interval.
+            // The first real trade in that bar must replace the placeholder OHLC.
+            b.open = price;
+            b.high = price;
+            b.low = price;
+            b.close = price;
+            b.volume = vol;
+            return;
+        }
+        if (price > b.high) b.high = price;
+        if (price < b.low) b.low = price;
+        b.close = price;
+        b.volume += vol;
+    };
+
+    auto it = std::lower_bound(
+        bars.begin(), bars.end(), barStart,
+        [](const OhlcvBar& b, Timestamp ts) { return b.start_ts < ts; });
+    if (it != bars.end() && it->start_ts == barStart) {
+        applyTradeToBar(*it);
+        return;
+    }
+
+    if (it == bars.end()) {
+        fillOhlcvGapsTo(bars, interval, barStart);
+        it = bars.end();
+    }
+
+    OhlcvBar b;
+    b.start_ts = barStart;
+    b.open = price;
+    b.high = price;
+    b.low = price;
+    b.close = price;
+    b.volume = vol;
+    bars.insert(it, b);
+}
+
 void CppCrossDataFactoryAgent::processAndPersistOhlcvIfNeeded() {
     if (m_sim_date_yyyymmdd.empty()) return;
     if (m_ohlcv_minutes > 0) {
         Timestamp d = intervalNsFromMinutes(m_ohlcv_minutes);
         if (d <= 0) return;
-        // persist time-based OHLCV bars:
-        // - If a minute has no trades, we still output a bar with volume=0 and OHLC=previous close.
-        // - Bars are aligned by `d` and keyed by `start_ts`.
-        // - We keep the last bar "open" (not persisted) unless we're flushing on STOP.
+        // OHLCV bars are now updated when EVENT_TRADE arrives. Periodic wakeups
+        // only flush already-built closed bars, so WAKEUP drift cannot create
+        // artificial zero-volume tail bars.
         const Timestamp now = getCurrentTime();
         const Timestamp endExclusive = (now > 0) ? ((now / d) * d) : 0;
-        const Timestamp lastClosedBarStart = (endExclusive >= d) ? (endExclusive - d) : 0;
-
-        auto isCurDate = [&](Timestamp ts) -> bool {
-            return formatDateYYYYMMDD(ts) == m_sim_date_yyyymmdd;
-        };
-        auto fillGapsTo = [&](std::vector<OhlcvBar>& bars, Timestamp targetBarStartExclusive) {
-            // Fill [lastCur + d, targetBarStartExclusive) using previous close (volume=0).
-            if (lastClosedBarStart <= 0) return;
-            if (targetBarStartExclusive <= 0) return;
-            // Cap to current time (only fill fully closed bars).
-            Timestamp cap = std::min(lastClosedBarStart + d, targetBarStartExclusive);
-            if (cap <= 0) return;
-
-            // Need at least one current-day bar to have an anchor close.
-            Timestamp lastCur = 0;
-            double lastClose = 0.0;
-            bool haveClose = false;
-            for (auto it = bars.rbegin(); it != bars.rend(); ++it) {
-                if (isCurDate(it->start_ts)) {
-                    lastCur = it->start_ts;
-                    lastClose = it->close;
-                    haveClose = std::isfinite(lastClose) && lastClose > 0.0;
-                    break;
-                }
-                if (formatDateYYYYMMDD(it->start_ts) < m_sim_date_yyyymmdd) break;
-            }
-            if (lastCur <= 0 || !haveClose) return;
-            if (lastCur + d >= cap) return;
-
-            for (Timestamp t = lastCur + d; t < cap; t += d) {
-                if (!isCurDate(t)) break;
-                OhlcvBar b;
-                b.start_ts = t;
-                b.open = lastClose; b.high = lastClose; b.low = lastClose; b.close = lastClose; b.volume = 0;
-                bars.push_back(b);
-            }
-        };
+        if (endExclusive <= 0) return;
 
         for (const auto& kv : m_asset_to_kernel) {
             const std::string& asset = kv.first;
             auto& bars = m_ohlcv_by_asset[asset];
-            auto& trades = m_trades_by_asset[asset];
-            size_t idx = m_trade_cursor_generic[asset];
-            if (idx > trades.size()) idx = trades.size();
-
-            // Consume any new trades and update bars.
-            for (; idx < trades.size(); ++idx) {
-                const auto& tr = trades[idx];
-                if (formatDateYYYYMMDD(tr.timestamp) != m_sim_date_yyyymmdd) continue;
-                Timestamp barStart = (tr.timestamp / d) * d;
-                double price = tr.price_float;
-                unsigned long long vol = static_cast<unsigned long long>(tr.volume);
-
-                // If bar does not exist at barStart, create it. If we already have seeded bars,
-                // this will naturally fill in the correct open from the first trade of the minute.
-                if (bars.empty() || bars.back().start_ts != barStart) {
-                    // Fill missing minutes between previous bar and this trade's minute.
-                    // (we fill strictly before barStart; barStart itself will be created by the trade)
-                    fillGapsTo(bars, barStart);
-                    if (bars.empty() || bars.back().start_ts != barStart) {
-                        OhlcvBar b;
-                        b.start_ts = barStart;
-                        b.open = price; b.high = price; b.low = price; b.close = price; b.volume = vol;
-                        bars.push_back(b);
-                    }
-                } else {
-                    auto& b = bars.back();
-                    if (price > b.high) b.high = price;
-                    if (price < b.low) b.low = price;
-                    b.close = price;
-                    b.volume += vol;
-                }
+            size_t writableEnd = 0;
+            while (writableEnd < bars.size() && bars[writableEnd].start_ts < endExclusive) {
+                ++writableEnd;
             }
-            m_trade_cursor_generic[asset] = idx;
-
-            // After consuming trades, if the last trade happened long ago, fill forward
-            // missing fully-closed bars up to "now" (this is what prevents OHLCV gaps during price-band halts).
-            fillGapsTo(bars, lastClosedBarStart + d);
-
-            size_t writableEnd = bars.size(); if (writableEnd > 0) { writableEnd -= 1; }
+            if (writableEnd > 0) {
+                // Keep the most recent closed bar in memory until a later tick/trade confirms
+                // no late in-order trade can still update it.
+                --writableEnd;
+            }
             size_t startIndex = m_persisted_generic_count[asset];
             if (startIndex < writableEnd) {
                 std::string path = ohlcvCsvPathMinutes(m_ohlcv_minutes, asset, m_sim_date_yyyymmdd);
@@ -704,9 +800,15 @@ void CppCrossDataFactoryAgent::appendOhlcvCsvRange(const std::string& path, cons
 void CppCrossDataFactoryAgent::flushOpenOhlcvBarsToDisk() {
     if (m_sim_date_yyyymmdd.empty()) return;
     if (m_ohlcv_minutes > 0) {
+        Timestamp d = intervalNsFromMinutes(m_ohlcv_minutes);
+        Timestamp now = getCurrentTime();
+        Timestamp endExclusive = (d > 0 && now > 0) ? ((now / d) * d) : 0;
         for (const auto& kv : m_asset_to_kernel) {
             const std::string& asset = kv.first;
             auto& bars = m_ohlcv_by_asset[asset];
+            if (d > 0 && endExclusive > 0) {
+                fillOhlcvGapsTo(bars, d, endExclusive);
+            }
             size_t startIndex = m_persisted_generic_count[asset];
             size_t endIndex = bars.size();
             if (startIndex < endIndex) {

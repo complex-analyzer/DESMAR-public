@@ -51,15 +51,19 @@
         <!-- LBTS polling sleep (microseconds):
              - LBTSPollIntervalMicrosKernel: kernel-side LBTS thread fallback polling sleep (used when doorbell-adaptive LBTS is disabled / not applicable)
              - LBTSPollIntervalMicrosAgent: agent-side LBTS thread polling sleep -->
-        <LBTSPollIntervalMicrosKernel>5</LBTSPollIntervalMicrosKernel>
-        <LBTSPollIntervalMicrosAgent>5</LBTSPollIntervalMicrosAgent>
+        <LBTSPollIntervalMicrosKernel>10</LBTSPollIntervalMicrosKernel>
+        <LBTSPollIntervalMicrosAgent>10</LBTSPollIntervalMicrosAgent>
 
-        <!-- doorbell-adaptive LBTS (optional):
-             - EnableAdaptiveLBTS: enable LBTS adaptive waiting (doorbell-based wakeup + short-sleep fallback)
-             - DoorbellShortSleepMicrosKernel: LBTS thread fallback sleep when no doorbell/changes are observed
-             Note: spin/yield-based waiting was removed; tuning is mainly via DoorbellShortSleepMicrosKernel + RMAPollIntervalMicros (receiveWorker polling sleep). -->
-        <EnableAdaptiveLBTS>false</EnableAdaptiveLBTS>
-        <DoorbellShortSleepMicrosKernel>5</DoorbellShortSleepMicrosKernel>
+        <!-- doorbell controls (optional):
+             - EnableMainMessageDoorbell: enable two-sided doorbell wakeups for RMA main-message receiveWorker polling
+             - MainMessageDoorbellShortSleepMicros: receiveWorker fallback sleep when no main-message doorbell or message is observed
+             - EnableSyncDoorbell: enable two-sided doorbell wakeups for LBTS heartbeat / G publication waiting
+             - SyncDoorbellShortSleepMicros: LBTS thread fallback sleep when no sync doorbell / window change is observed
+             Note: spin/yield-based waiting was removed; tuning is mainly via the two short-sleep knobs plus RMAPollIntervalMicros. -->
+        <EnableMainMessageDoorbell>false</EnableMainMessageDoorbell>
+        <MainMessageDoorbellShortSleepMicros>10</MainMessageDoorbellShortSleepMicros>
+        <EnableSyncDoorbell>false</EnableSyncDoorbell>
+        <SyncDoorbellShortSleepMicros>10</SyncDoorbellShortSleepMicros>
 
         <!-- kernel-to-kernel LBTS lookahead (nanoseconds).
              This parameter provides a fixed positive lookahead between simulation kernels,
@@ -72,7 +76,7 @@
         <KernelRMAWindowMB>128</KernelRMAWindowMB>
         <AgentRMAWindowMB>64</AgentRMAWindowMB>
         <!-- RMA polling sleep time (microseconds), default 5. The smaller the polling frequency, the higher the CPU usage, and the lower the delay. -->
-        <RMAPollIntervalMicros>5</RMAPollIntervalMicros>
+        <RMAPollIntervalMicros>10</RMAPollIntervalMicros>
         <!-- RMA send backoff upper limit (microseconds). After reaching the upper limit, continue to wait at a fixed interval until there is an empty position. Default 200. -->
         <RMAPutBackoffMicrosMax>200</RMAPutBackoffMicrosMax>
         <!-- Whether to enable the lock_all mode of RMA (default false). After enabling, use lock_all instead of per-message per-target lock to improve concurrency throughput. -->
@@ -103,8 +107,8 @@
         <!-- Aligned message time-shift statistics (kernel/agent side controls):
              - EnableAlignedMessageStatsKernel: enable kernel-side aligned message stats (alignment distribution and per-type ratio);
              - EnableAlignedMessageStatsAgent: enable agent-side aligned message stats. -->
-        <EnableAlignedMessageStatsKernel>false</EnableAlignedMessageStatsKernel>
-        <EnableAlignedMessageStatsAgent>false</EnableAlignedMessageStatsAgent>
+        <EnableAlignedMessageStatsKernel>true</EnableAlignedMessageStatsKernel>
+        <EnableAlignedMessageStatsAgent>true</EnableAlignedMessageStatsAgent>
 
         <!-- Whether WAKEUP (0-delay control message) participates in LBTS:
              - true: WAKEUP participates in LBTS as a no-delay message (MUST NOT be treated as +BaseLookaheadNs)
@@ -161,7 +165,7 @@
             name="ORDER_LOG_AGENT"
             flushImmediately="false"
             logToConsole="true"
-            outputFile="/home/sun/Projects/DESMAR/data/agent_outputs/OrderActionLogAgent/"
+            outputFile="/home/sun/Projects/DESMAR_public_ready/data/agent_outputs/OrderActionLogAgent/"
             />
 
         <!-- simple single impact agent example - need to explicitly specify name to avoid duplication -->
@@ -243,7 +247,7 @@
             count="30"
             startIndex="1"
 
-            weightDirichletAlpha="0.1,0.6,0.1"
+            weightDirichletAlpha="0.1,0.8,0.1"
             heuristicSigmaNRange="100.0,100.0"
             heuristicKappaRange="1.67e-15,1.67e-15"
             heuristicSigmaSRange="1e-8,1e-8"
@@ -252,7 +256,7 @@
             momentumLongWindowRange="50,50"
 
             startingCashRange="10000,10000"
-            wakeupIntervalRange="300.0, 900.0"
+            wakeupIntervalRange="900.0, 900.0"
             wakeupDistributionMode="Poisson"
             uniformWakeupPerturbSeconds="120.0"
             maxWakeupIntervalRange="3600.0"
@@ -304,7 +308,7 @@
             count="30"
             startIndex="31"
 
-            weightDirichletAlpha="0.1,0.6,0.1"
+            weightDirichletAlpha="0.1,0.8,0.1"
             heuristicSigmaNRange="100.0,100.0"
             heuristicKappaRange="1.67e-15,1.67e-15"
             heuristicSigmaSRange="1e-8,1e-8"
@@ -313,7 +317,7 @@
             momentumLongWindowRange="50,50"
 
             startingCashRange="10000,10000"
-            wakeupIntervalRange="300.0, 900.0"
+            wakeupIntervalRange="900.0, 900.0"
             wakeupDistributionMode="Poisson"
             uniformWakeupPerturbSeconds="120.0"
             maxWakeupIntervalRange="3600.0"
@@ -365,7 +369,7 @@
             count="30"
             startIndex="61"
 
-            weightDirichletAlpha="0.1,0.6,0.1"
+            weightDirichletAlpha="0.1,0.8,0.1"
             heuristicSigmaNRange="100.0,100.0"
             heuristicKappaRange="1.67e-15,1.67e-15"
             heuristicSigmaSRange="1e-8,1e-8"
@@ -374,7 +378,7 @@
             momentumLongWindowRange="50,50"
 
             startingCashRange="10000,10000"
-            wakeupIntervalRange="300.0, 900.0"
+            wakeupIntervalRange="900.0, 900.0"
             wakeupDistributionMode="Poisson"
             uniformWakeupPerturbSeconds="120.0"
             maxWakeupIntervalRange="3600.0"

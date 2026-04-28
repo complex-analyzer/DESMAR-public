@@ -26,6 +26,7 @@ LEARNER_EXP_DATA_TAG = 9002
 LEARNER_CTRL_END_TAG = 9003
 LEARNER_PARAM_LEN_TAG = 9004
 LEARNER_PARAM_DATA_TAG = 9005
+LEARNER_COMM_CREATE_TAG = 9106
 
 BATCH_MAGIC = b'BEXP'
 
@@ -84,7 +85,9 @@ def main():
     try:
         g = MPI.COMM_WORLD.Get_group()
         lgrp = g.Incl(members)
-        lcomm = MPI.COMM_WORLD.Create_group(lgrp)
+        print(f"[learner_mpi] learnerComm create enter members={members} tag={LEARNER_COMM_CREATE_TAG}", flush=True)
+        lcomm = MPI.COMM_WORLD.Create_group(lgrp, LEARNER_COMM_CREATE_TAG)
+        print(f"[learner_mpi] learnerComm create exit is_null={lcomm == MPI.COMM_NULL} tag={LEARNER_COMM_CREATE_TAG}", flush=True)
         lgrp.Free(); g.Free()
     except Exception as e:
         print('[learner_mpi] create learnerComm failed:', e)

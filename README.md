@@ -29,7 +29,7 @@ This project is now a **pure C++ simulation plus deep reinforcement learning** f
 
 ## II. Detailed Environment Configuration:
 
-**IMPORTANT - First-Time Users Must Read**: This repository still contains hard-coded absolute paths. **You must replace them with paths that match your own machine** before building or running. See sections 3) and 4) below.
+**IMPORTANT - First-Time Users Must Read**: This repository still contains hard-coded absolute paths. If your local checkout path differs from the paths currently embedded in the scripts and configuration files, you must update them before use. See sections 3) and 4) below for details.
 
 ### 1) System-Level Dependencies Installation (Current Configuration)
 * CMake ≥ 3.15 (recommended ≥ 3.20)
@@ -71,60 +71,46 @@ corresponding `conda activate ...` lines in the run scripts.
 
 ### 3) Path Configuration and Replacement
 
-**IMPORTANT:** before building or running, **replace every hard-coded absolute path** in this repository with the corresponding path on your machine.
+**IMPORTANT: The current checkout uses `/home/sun/Projects/DESMAR_public_ready` as the embedded project root in several scripts and XML files. If your local checkout is in a different directory, replace that prefix with your actual project path.**
 
-There are two different path categories:
+Affected files and replacement instructions:
 
-a) **Project checkout path** (`/home/sun/Projects/DESMAR`)
-* This path is mainly used by launcher scripts and output locations.
-* **Replace** the embedded `/home/sun/Projects/DESMAR` prefix with your actual project root in:
+a) **Launcher Scripts** (`PROJECT_ROOT`)
+* The following scripts currently contain `PROJECT_ROOT="/home/sun/Projects/DESMAR_public_ready"`:
   - `run_multi_asset_with_HRL_agent.sh`
   - `run_multi_asset_with_SPT_agent.sh`
   - `run_single_asset_multi_processes.sh`
   - `run_single_asset_singel_process.sh`
-* In particular, check hard-coded `PROJECT_ROOT="/home/sun/Projects/DESMAR"` assignments and related temporary / output directories derived from that path.
+* Replacement method: replace `/home/sun/Projects/DESMAR_public_ready` with the absolute path to your local DESMAR checkout
 
-b) **XML output paths**
-* If the configuration enables `OrderActionLogAgent`, update its `outputFile` path so order logs are written under your actual project root instead of `/home/sun/Projects/DESMAR/...`
-* These XML output paths mainly affect runtime output location, not whether CMake configuration succeeds.
+b) **XML Configuration Files** (`outputFile`)
+* If the configuration enables `OrderActionLogAgent`, update its `outputFile` path so order logs are written under your actual project root instead of `/home/sun/Projects/DESMAR_public_ready/...`
 
 
 ### 4) LibTorch Configuration (for Deep Learning Functionality)
 
-a) **Build-Critical Paths**
-* The following hard-coded paths directly affect whether `cmake` can configure the project successfully:
-  - `TheSimulator/TheSimulator/CMakeLists.txt`
-* In the current checkout, this file contains:
-  - `CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-12.4"`
-  - `CMAKE_CUDA_COMPILER "/usr/local/cuda-12.4/bin/nvcc"`
-  - `CUDA_nvrtc_LIBRARY "/usr/local/cuda-12.4/targets/x86_64-linux/lib/libnvrtc.so.12.4.127"`
-  - `find_package(Torch REQUIRED PATHS "/home/sun/torch/libtorch")`
-* **Replace** these entries so they point to your CUDA toolkit, your real `libnvrtc.so...` file, and your LibTorch root **before** running CMake.
-* When CUDA is not exactly this layout or version, update every CUDA-related line above accordingly. In particular, `CUDA_nvrtc_LIBRARY` must be the actual `libnvrtc.so...` path on your system.
-
-b) **Runtime Script Paths**
-* The repository also embeds `/home/sun/torch/libtorch` in runtime scripts for loading shared libraries.
-* **Replace** every occurrence of that LibTorch prefix in:
+a) **Path Configuration**
+* The current checkout uses `/home/sun/torch/libtorch` as the embedded LibTorch root.
+* If your LibTorch installation is in a different location, replace that path in:
   - `TheSimulator/TheSimulator/CMakeLists.txt`
   - `run_multi_asset_with_HRL_agent.sh`
   - `run_multi_asset_with_SPT_agent.sh`
   - `run_single_asset_multi_processes.sh`
-* Typical patterns to update:
+* Current hard-coded examples in this repository include:
+  - `find_package(Torch REQUIRED PATHS "/home/sun/torch/libtorch")`
   - `LIBTORCH_CMAKE_DIR="/home/sun/torch/libtorch/lib"`
   - `TORCH_LIB_DIR="/home/sun/torch/libtorch/lib"`
-* **Replace** the `/home/sun/torch/libtorch` prefix with your actual LibTorch root everywhere it appears.
+* If your LibTorch installation is elsewhere, replace the `/home/sun/torch/libtorch` prefix with your actual LibTorch root.
 
-c) **LibTorch Installation Recommendations**
+b) **LibTorch Installation Recommendations**
 * Download pre-compiled LibTorch C++ distribution from PyTorch official website
 * Or install via conda (example for the current CUDA 12.4 setup):
   - conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
-* Ensure the selected PyTorch / LibTorch build is compatible with your local CUDA installation.
-* For the current repository state, changing only the project checkout path is **not** enough for compilation; you **must** update the hard-coded CUDA / LibTorch entries in `TheSimulator/TheSimulator/CMakeLists.txt` to match your local installation.
+* Ensure the selected PyTorch / LibTorch build is compatible with your local CUDA installation. The current repository configuration is hard-coded to CUDA 12.4 paths, so if you use another CUDA version, update the corresponding CUDA and LibTorch paths in `TheSimulator/TheSimulator/CMakeLists.txt`.
+* Verify installation: Ensure ${TORCH_LIBRARIES} can be correctly linked to the distributed_simulator target
 
 ### 5) Build
 Run the following commands from the project root directory.
-
-Before running these commands, make sure you have already updated the hard-coded CUDA / LibTorch paths described in section 4.
 
 * Clean configure + build:
   - `rm -rf build`
@@ -159,6 +145,7 @@ The following launcher scripts provide quick-start entry points for common DESMA
   - Multi-asset setting
   - Simulation with a hierarchical reinforcement learning cross-asset agent
   - Example configuration files: `Simulator_configs/multi_assets_HRL_agent_filled/SimulationKernel_configs_distributed_*.xml`
+  - When training or using the BDQ order-execution module, set `hierarchicalDecision="true"` in the `CrossRLAgents` XML configuration.
 
 Run these scripts from the project root directory, for example:
 * `bash run_single_asset_singel_process.sh`
@@ -181,10 +168,9 @@ a) **Main Message Communication**
 b) **Conservative Synchronization**
 * The conservative synchronization channel is controlled by `--sync` or `DESMAR_LBTS_SYNC`.
 * Supported modes:
-  - `one`: one-sided RMA heartbeat and global-safe-time publication
-  - `two`: two-sided heartbeat and global-safe-time notification
-  - `iallreduce`: global `MPI_Iallreduce(MIN)` baseline synchronization
-* **Important limitation:** the current `iallreduce` mode does not support cross-epoch runs. It should only be used for single-epoch executions.
+  - `one`: one-sided RMA heartbeat and safe-time publication
+  - `two`: two-sided heartbeat and safe-time notification
+  - `iallreduce`: `MPI_Iallreduce(MIN)` baseline CMB synchronization
 
 c) **MPI Threading Mode**
 * The launcher also exposes `--mpi-mode` or `DESMAR_MPI_MODE`.

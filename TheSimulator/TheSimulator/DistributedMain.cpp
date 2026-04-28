@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
@@ -36,6 +37,9 @@
 #include "FundamentalValueModel.h"
 
 namespace {
+    static constexpr int COMPONENT_COMM_CREATE_TAG = 1201;
+    static constexpr int CPP_ONLY_COMM_CREATE_TAG = 1001;
+
     static inline bool isLeapYear(int y) {
         return ((y % 4) == 0 && (y % 100) != 0) || ((y % 400) == 0);
     }
@@ -257,8 +261,11 @@ namespace {
             std::fflush(stdout);
             std::fflush(stderr);
 
-            (void)::freopen(outPath.string().c_str(), "w", stdout);
-            (void)::freopen(errPath.string().c_str(), "w", stderr);
+            FILE* outFile = ::freopen(outPath.string().c_str(), "w", stdout);
+            FILE* errFile = ::freopen(errPath.string().c_str(), "w", stderr);
+            if (!outFile || !errFile) {
+                return;
+            }
 
             // Clear C++ stream states in case freopen changed underlying fds.
             std::cout.clear();
@@ -787,6 +794,284 @@ namespace {
         return !outAssets.empty();
     }
 
+    static inline std::vector<int> parseCsvInts(const std::string& s) {
+        std::vector<int> out;
+        if (s.empty()) return out;
+        std::stringstream ss(s);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (tok.empty()) continue;
+            try {
+                out.push_back(std::stoi(tok));
+            } catch (...) {
+            }
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+
+    static inline std::string formatIntList(const std::vector<int>& values) {
+        std::ostringstream oss;
+        oss << "{";
+        for (size_t i = 0; i < values.size(); ++i) {
+            oss << values[i];
+            if (i + 1 < values.size()) oss << ",";
+        }
+        oss << "}";
+        return oss.str();
+    }
+
+    struct MultiKernelCommunicationTopology {
+        std::vector<int> kernelRanks;
+        std::unordered_map<int, std::vector<int>> agentRanksByKernel;
+        std::unordered_map<int, std::vector<int>> crossRanksByKernel;
+        std::unordered_map<int, std::vector<int>> crossAgentSenders;
+        std::unordered_map<int, size_t> remoteWindowBytesByKernel;
+        std::unordered_map<int, int> kernelComponentByKernel;
+    };
+
+    struct ComponentCommunicationView {
+        int componentId{-1};
+        std::vector<int> kernelRanks;
+        std::vector<int> agentRanks;
+        std::vector<int> crossRanks;
+        std::vector<int> members;
+        std::unordered_map<int, std::vector<int>> agentRanksByKernel;
+        std::unordered_map<int, std::vector<int>> crossRanksByKernel;
+        std::unordered_map<int, std::vector<int>> crossAgentSenders;
+        std::unordered_map<int, size_t> remoteWindowBytesByKernel;
+    };
+
+    static inline MultiKernelCommunicationTopology buildMultiKernelCommunicationTopology(
+            const pugi::xml_node& rootNode,
+            const std::vector<int>& discoveredKernelRanks) {
+        MultiKernelCommunicationTopology topo;
+        topo.kernelRanks = discoveredKernelRanks;
+        std::sort(topo.kernelRanks.begin(), topo.kernelRanks.end());
+        topo.kernelRanks.erase(std::unique(topo.kernelRanks.begin(), topo.kernelRanks.end()), topo.kernelRanks.end());
+
+        if (auto mk = rootNode.child("MultiKernel")) {
+            for (auto kn = mk.child("Kernel"); kn; kn = kn.next_sibling("Kernel")) {
+                int kr = kn.attribute("rank").as_int(-1);
+                if (kr < 0) continue;
+                topo.kernelRanks.push_back(kr);
+                auto agents = parseCsvInts(kn.attribute("agentRanks").as_string());
+                if (!agents.empty()) topo.agentRanksByKernel[kr] = std::move(agents);
+                auto cross = parseCsvInts(kn.attribute("crossAgentRanks").as_string());
+                if (!cross.empty()) {
+                    topo.crossRanksByKernel[kr] = cross;
+                    for (int cr : cross) {
+                        topo.crossAgentSenders[cr].push_back(kr);
+                    }
+                }
+                size_t rmb = kn.attribute("kernelWindowMB").as_uint(0);
+                if (rmb > 0) {
+                    topo.remoteWindowBytesByKernel[kr] = rmb * 1024ull * 1024ull;
+                }
+            }
+        }
+
+        if (!rootNode.child("MultiKernel")) {
+            int simRank = 0;
+            if (auto mpiCfg = rootNode.child("MPIConfiguration")) {
+                simRank = mpiCfg.child("SimulationRank").text().as_int(0);
+                auto agents = parseCsvInts(mpiCfg.child("AgentRanks").text().as_string());
+                if (!agents.empty()) {
+                    topo.agentRanksByKernel[simRank] = std::move(agents);
+                }
+                auto cross = parseCsvInts(mpiCfg.child("CrossAgentRanks").text().as_string());
+                if (!cross.empty()) {
+                    topo.crossRanksByKernel[simRank] = cross;
+                    for (int cr : cross) {
+                        topo.crossAgentSenders[cr].push_back(simRank);
+                    }
+                }
+            }
+            topo.kernelRanks.push_back(simRank);
+        }
+
+        std::sort(topo.kernelRanks.begin(), topo.kernelRanks.end());
+        topo.kernelRanks.erase(std::unique(topo.kernelRanks.begin(), topo.kernelRanks.end()), topo.kernelRanks.end());
+        for (auto& kv : topo.crossAgentSenders) {
+            auto& senders = kv.second;
+            std::sort(senders.begin(), senders.end());
+            senders.erase(std::unique(senders.begin(), senders.end()), senders.end());
+        }
+
+        if (topo.kernelRanks.empty()) {
+            return topo;
+        }
+
+        std::unordered_map<int, int> kernelIndex;
+        kernelIndex.reserve(topo.kernelRanks.size());
+        for (size_t i = 0; i < topo.kernelRanks.size(); ++i) {
+            kernelIndex[topo.kernelRanks[i]] = static_cast<int>(i);
+        }
+        std::vector<int> parent(topo.kernelRanks.size());
+        std::iota(parent.begin(), parent.end(), 0);
+        std::function<int(int)> findRoot = [&](int x) -> int {
+            if (parent[x] == x) return x;
+            parent[x] = findRoot(parent[x]);
+            return parent[x];
+        };
+        auto unite = [&](int a, int b) {
+            int ra = findRoot(a);
+            int rb = findRoot(b);
+            if (ra != rb) parent[rb] = ra;
+        };
+        for (const auto& kv : topo.crossAgentSenders) {
+            const auto& kernels = kv.second;
+            for (size_t i = 1; i < kernels.size(); ++i) {
+                auto ita = kernelIndex.find(kernels[0]);
+                auto itb = kernelIndex.find(kernels[i]);
+                if (ita != kernelIndex.end() && itb != kernelIndex.end()) {
+                    unite(ita->second, itb->second);
+                }
+            }
+        }
+
+        std::unordered_map<int, int> rootToDense;
+        int nextDense = 0;
+        for (int kr : topo.kernelRanks) {
+            int idx = kernelIndex[kr];
+            int root = findRoot(idx);
+            auto [it, inserted] = rootToDense.emplace(root, nextDense);
+            if (inserted) nextDense++;
+            topo.kernelComponentByKernel[kr] = it->second;
+        }
+        return topo;
+    }
+
+    static inline ComponentCommunicationView buildComponentCommunicationView(
+            const MultiKernelCommunicationTopology& topo,
+            int rank,
+            int simRankGlobal,
+            bool isKernel,
+            bool isCross,
+            bool baselineFullMesh) {
+        ComponentCommunicationView view;
+        if (topo.kernelRanks.empty()) return view;
+
+        if (baselineFullMesh) {
+            view.componentId = 0;
+            view.kernelRanks = topo.kernelRanks;
+        } else if (isCross) {
+            auto it = topo.crossAgentSenders.find(rank);
+            if (it != topo.crossAgentSenders.end() && !it->second.empty()) {
+                auto compIt = topo.kernelComponentByKernel.find(it->second.front());
+                if (compIt != topo.kernelComponentByKernel.end()) {
+                    view.componentId = compIt->second;
+                }
+            }
+            if (view.componentId < 0) {
+                auto fallback = topo.kernelComponentByKernel.find(simRankGlobal);
+                if (fallback != topo.kernelComponentByKernel.end()) {
+                    view.componentId = fallback->second;
+                    std::cout << "[TOPO][COMPONENT][WARN] rank=" << rank
+                              << " role=cross fallback_to_sim_kernel=" << simRankGlobal
+                              << " reason=no_cross_sender_mapping"
+                              << std::endl;
+                }
+            }
+        } else {
+            auto compIt = topo.kernelComponentByKernel.find(simRankGlobal);
+            if (compIt != topo.kernelComponentByKernel.end()) {
+                view.componentId = compIt->second;
+            }
+        }
+
+        if (view.componentId < 0) {
+            view.componentId = 0;
+            if (!baselineFullMesh) {
+                std::cout << "[TOPO][COMPONENT][WARN] rank=" << rank
+                          << " fallback_component=0 reason=missing_component_mapping"
+                          << std::endl;
+            }
+        }
+
+        for (int kr : topo.kernelRanks) {
+            auto compIt = topo.kernelComponentByKernel.find(kr);
+            if (!baselineFullMesh && (compIt == topo.kernelComponentByKernel.end() || compIt->second != view.componentId)) {
+                continue;
+            }
+            view.kernelRanks.push_back(kr);
+            auto itAgents = topo.agentRanksByKernel.find(kr);
+            if (itAgents != topo.agentRanksByKernel.end()) {
+                view.agentRanksByKernel[kr] = itAgents->second;
+                view.agentRanks.insert(view.agentRanks.end(), itAgents->second.begin(), itAgents->second.end());
+            }
+            auto itCross = topo.crossRanksByKernel.find(kr);
+            if (itCross != topo.crossRanksByKernel.end()) {
+                view.crossRanksByKernel[kr] = itCross->second;
+                view.crossRanks.insert(view.crossRanks.end(), itCross->second.begin(), itCross->second.end());
+            }
+            auto itWin = topo.remoteWindowBytesByKernel.find(kr);
+            if (itWin != topo.remoteWindowBytesByKernel.end()) {
+                view.remoteWindowBytesByKernel[kr] = itWin->second;
+            }
+        }
+
+        std::sort(view.kernelRanks.begin(), view.kernelRanks.end());
+        view.kernelRanks.erase(std::unique(view.kernelRanks.begin(), view.kernelRanks.end()), view.kernelRanks.end());
+        std::sort(view.agentRanks.begin(), view.agentRanks.end());
+        view.agentRanks.erase(std::unique(view.agentRanks.begin(), view.agentRanks.end()), view.agentRanks.end());
+        std::sort(view.crossRanks.begin(), view.crossRanks.end());
+        view.crossRanks.erase(std::unique(view.crossRanks.begin(), view.crossRanks.end()), view.crossRanks.end());
+
+        for (int cr : view.crossRanks) {
+            auto it = topo.crossAgentSenders.find(cr);
+            if (it == topo.crossAgentSenders.end()) continue;
+            std::vector<int> senders;
+            for (int kr : it->second) {
+                auto compIt = topo.kernelComponentByKernel.find(kr);
+                if (baselineFullMesh || (compIt != topo.kernelComponentByKernel.end() && compIt->second == view.componentId)) {
+                    senders.push_back(kr);
+                }
+            }
+            std::sort(senders.begin(), senders.end());
+            senders.erase(std::unique(senders.begin(), senders.end()), senders.end());
+            if (!senders.empty()) {
+                view.crossAgentSenders[cr] = std::move(senders);
+            }
+        }
+
+        view.members = view.kernelRanks;
+        view.members.insert(view.members.end(), view.agentRanks.begin(), view.agentRanks.end());
+        view.members.insert(view.members.end(), view.crossRanks.begin(), view.crossRanks.end());
+        if (isKernel || !isCross) {
+            view.members.push_back(rank);
+        } else if (std::find(view.crossRanks.begin(), view.crossRanks.end(), rank) == view.crossRanks.end()) {
+            view.members.push_back(rank);
+            view.crossRanks.push_back(rank);
+            std::sort(view.crossRanks.begin(), view.crossRanks.end());
+            view.crossRanks.erase(std::unique(view.crossRanks.begin(), view.crossRanks.end()), view.crossRanks.end());
+        }
+        std::sort(view.members.begin(), view.members.end());
+        view.members.erase(std::unique(view.members.begin(), view.members.end()), view.members.end());
+        return view;
+    }
+
+    static inline MPI_Comm createGroupCommunicatorForMembers(const std::vector<int>& members, int rank) {
+        if (members.empty()) return MPI_COMM_NULL;
+        if (std::find(members.begin(), members.end(), rank) == members.end()) return MPI_COMM_NULL;
+        MPI_Group worldGroup = MPI_GROUP_NULL;
+        MPI_Group subGroup = MPI_GROUP_NULL;
+        MPI_Comm newComm = MPI_COMM_NULL;
+        MPI_Comm_group(MPI_COMM_WORLD, &worldGroup);
+        MPI_Group_incl(worldGroup, static_cast<int>(members.size()), members.data(), &subGroup);
+        std::cout << "[COMPONENT_COMM][CREATE_ENTER] rank=" << rank
+                  << " members=" << formatIntList(members)
+                  << " tag=" << COMPONENT_COMM_CREATE_TAG << std::endl;
+        MPI_Comm_create_group(MPI_COMM_WORLD, subGroup, COMPONENT_COMM_CREATE_TAG, &newComm);
+        std::cout << "[COMPONENT_COMM][CREATE_EXIT] rank=" << rank
+                  << " commNull=" << (newComm == MPI_COMM_NULL ? "true" : "false")
+                  << " tag=" << COMPONENT_COMM_CREATE_TAG << std::endl;
+        if (subGroup != MPI_GROUP_NULL) MPI_Group_free(&subGroup);
+        if (worldGroup != MPI_GROUP_NULL) MPI_Group_free(&worldGroup);
+        return newComm;
+    }
+
     static inline nlohmann::json buildInitialAssignmentFromConfig(const pugi::xml_node& rootNode,
                                                                   const std::string& yyyymmdd) {
         nlohmann::json j;
@@ -858,6 +1143,16 @@ namespace {
         std::stringstream ss; ss << ifs.rdbuf();
         auto j = nlohmann::json::parse(ss.str(), nullptr, /*allow_exceptions=*/false);
         if (j.is_discarded()) return nlohmann::json();
+        return j;
+    }
+
+    static inline nlohmann::json readAssignmentFileOrThrow(const std::string& yyyymmdd) {
+        const auto p = assignmentFilePath(yyyymmdd);
+        auto j = readJsonFile(p);
+        if (!j.is_object() || !j.contains("agents") || !j["agents"].is_object()) {
+            throw std::runtime_error("[Topology][Assignment][FATAL] invalid or missing assignment file for date=" +
+                                     yyyymmdd + " path=" + p.string());
+        }
         return j;
     }
 
@@ -1617,23 +1912,6 @@ namespace {
         return out;
     }
 
-    static inline int pickFallbackCrossRankForKernel(
-        int kernelRank,
-        const std::vector<int>& crossRanksAllSortedUnique,
-        const std::unordered_map<int, std::vector<int>>& crossRanksByNode,
-        const std::vector<int>& worldRankToNodeId
-    ) {
-        if (crossRanksAllSortedUnique.empty()) return -1;
-        const uint64_t h = splitmix64(static_cast<uint64_t>(static_cast<uint32_t>(kernelRank)));
-        const int nodeK = nodeIdForRankSafe(worldRankToNodeId, kernelRank);
-        auto it = crossRanksByNode.find(nodeK);
-        if (it != crossRanksByNode.end() && !it->second.empty()) {
-            const auto& lst = it->second;
-            return lst[(size_t)(h % (uint64_t)lst.size())];
-        }
-        return crossRanksAllSortedUnique[(size_t)(h % (uint64_t)crossRanksAllSortedUnique.size())];
-    }
-
     // Two-level partitioning:
     // 1) agents -> nodes (only nodes that have >=1 cross rank)
     // 2) within each node, agents -> cross ranks on that node
@@ -1877,10 +2155,7 @@ namespace {
         );
 
         // Start from previous day's assignment (carry forward non-SPT agents like DataFactory/RL).
-        nlohmann::json assign = readJsonFile(assignmentFilePath(epochDate));
-        if (!assign.is_object() || !assign.contains("agents") || !assign["agents"].is_object()) {
-            assign = buildInitialAssignmentFromConfig(rootNode, epochDate);
-        }
+        nlohmann::json assign = readAssignmentFileOrThrow(epochDate);
         assign["date"] = nextDate;
 
         // Only assign SPT agents here (others keep their original ranks from current assignment file).
@@ -1921,25 +2196,21 @@ namespace {
             }
         }
 
-        // Ensure every kernel has at least one covering cross rank.
-        // Only activate when a kernel currently has NO coverage from any agent basket.
-        // (If already covered, we do not add extra ranks.)
-        std::unordered_set<int> allKernelRanks;
-        allKernelRanks.reserve(asset2kernel.size());
+        // Keep uncovered kernels disconnected: serialize an explicit empty list instead of
+        // forcing a fallback cross-rank connection.
+        std::set<int> allKernelRanks;
         for (const auto& kv : asset2kernel) allKernelRanks.insert(kv.second);
-        nlohmann::json fallbackKernels = nlohmann::json::object(); // kernelRank -> fallbackCrossRank
+        nlohmann::json uncoveredKernels = nlohmann::json::array();
         for (int k : allKernelRanks) {
-            auto& s = k2r[k]; // creates empty set if absent
-            if (!s.empty()) continue;
-            int fallback = pickFallbackCrossRankForKernel(k, crossRanks, crossByNode, worldRankToNodeId);
-            if (fallback >= 0) s.insert(fallback);
-            if (fallback >= 0) fallbackKernels[std::to_string(k)] = fallback;
-        }
-
-        for (const auto& kv : k2r) {
-            std::vector<int> lst(kv.second.begin(), kv.second.end());
-            std::sort(lst.begin(), lst.end());
-            kernelMap["kernel_to_cross_ranks"][std::to_string(kv.first)] = lst;
+            std::vector<int> lst;
+            auto it = k2r.find(k);
+            if (it != k2r.end()) {
+                lst.assign(it->second.begin(), it->second.end());
+                std::sort(lst.begin(), lst.end());
+            } else {
+                uncoveredKernels.push_back(k);
+            }
+            kernelMap["kernel_to_cross_ranks"][std::to_string(k)] = lst;
         }
         (void)writeJsonAtomic(crossTopologyDir() / (std::string("kernel_cross_") + nextDate + ".json"), kernelMap);
 
@@ -1969,8 +2240,8 @@ namespace {
                 row["cross_rank"] = (itC == agentToCross.end()) ? -1 : itC->second;
                 j["agents"][agent] = row;
             }
-            j["fallback_kernels"] = fallbackKernels;
-            j["fallback_kernels_count"] = (int)fallbackKernels.size();
+            j["uncovered_kernels"] = uncoveredKernels;
+            j["uncovered_kernels_count"] = (int)uncoveredKernels.size();
             (void)writeJsonAtomic(crossTopologyDir() / (std::string("hierarchy_") + nextDate + ".json"), j);
         }
 
@@ -1992,6 +2263,7 @@ namespace {
         const std::vector<int>& crossRanksAll,
         const std::vector<int>& worldRankToNodeId
     ) {
+        (void)worldRankToNodeId;
         std::unordered_map<std::string,int> asset2kernel;
         std::vector<std::string> assets;
         (void)parseMultiKernelTargets(rootNode, asset2kernel, assets);
@@ -2012,25 +2284,8 @@ namespace {
             return;
         }
 
-        // Build crossByNode map for fallback placement (reuse existing helper).
-        std::unordered_map<int, std::vector<int>> crossByNode;
-        crossByNode.reserve(crossRanks.size());
-        for (int cr : crossRanks) {
-            int nid = 0;
-            if (cr >= 0 && cr < (int)worldRankToNodeId.size()) nid = worldRankToNodeId[(size_t)cr];
-            crossByNode[nid].push_back(cr);
-        }
-        for (auto& kv : crossByNode) {
-            auto& lst = kv.second;
-            std::sort(lst.begin(), lst.end());
-            lst.erase(std::unique(lst.begin(), lst.end()), lst.end());
-        }
-
         // Load current assignment (epochDate). In baseline this is usually the static XML mapping.
-        nlohmann::json assign = readJsonFile(assignmentFilePath(epochDate));
-        if (!assign.is_object() || !assign.contains("agents") || !assign["agents"].is_object()) {
-            assign = buildInitialAssignmentFromConfig(rootNode, epochDate);
-        }
+        nlohmann::json assign = readAssignmentFileOrThrow(epochDate);
         // Carry forward assignment unchanged (only update date field) so offline evaluation remains consistent.
         assign["date"] = nextDate;
         (void)writeJsonAtomic(assignmentFilePath(nextDate), assign);
@@ -2053,26 +2308,24 @@ namespace {
             }
         }
 
-        // Ensure every kernel has at least one covering cross rank (only when uncovered).
-        std::unordered_set<int> allKernelRanks;
-        allKernelRanks.reserve(asset2kernel.size());
+        // Keep uncovered kernels disconnected: serialize an explicit empty list instead of
+        // forcing a fallback cross-rank connection.
+        std::set<int> allKernelRanks;
         for (const auto& kv : asset2kernel) allKernelRanks.insert(kv.second);
-        nlohmann::json fallbackKernels = nlohmann::json::object();
+        nlohmann::json uncoveredKernels = nlohmann::json::array();
         for (int k : allKernelRanks) {
-            auto& s = k2r[k]; // creates empty set if absent
-            if (!s.empty()) continue;
-            int fallback = pickFallbackCrossRankForKernel(k, crossRanks, crossByNode, worldRankToNodeId);
-            if (fallback >= 0) s.insert(fallback);
-            if (fallback >= 0) fallbackKernels[std::to_string(k)] = fallback;
+            std::vector<int> lst;
+            auto it = k2r.find(k);
+            if (it != k2r.end()) {
+                lst.assign(it->second.begin(), it->second.end());
+                std::sort(lst.begin(), lst.end());
+            } else {
+                uncoveredKernels.push_back(k);
+            }
+            kernelMap["kernel_to_cross_ranks"][std::to_string(k)] = lst;
         }
-
-        for (const auto& kv : k2r) {
-            std::vector<int> lst(kv.second.begin(), kv.second.end());
-            std::sort(lst.begin(), lst.end());
-            kernelMap["kernel_to_cross_ranks"][std::to_string(kv.first)] = lst;
-        }
-        kernelMap["fallback_kernels"] = fallbackKernels;
-        kernelMap["fallback_kernels_count"] = (int)fallbackKernels.size();
+        kernelMap["uncovered_kernels"] = uncoveredKernels;
+        kernelMap["uncovered_kernels_count"] = (int)uncoveredKernels.size();
 
         (void)writeJsonAtomic(crossTopologyDir() / (std::string("kernel_cross_") + nextDate + ".json"), kernelMap);
 
@@ -2108,6 +2361,22 @@ namespace {
                                                         const std::unordered_map<int, std::vector<int>>& k2r) {
         auto mk = rootNode.child("MultiKernel");
         if (!mk) return;
+        std::vector<int> missing;
+        for (auto kn = mk.child("Kernel"); kn; kn = kn.next_sibling("Kernel")) {
+            int kr = kn.attribute("rank").as_int(-1);
+            if (kr < 0) continue;
+            if (k2r.find(kr) == k2r.end()) missing.push_back(kr);
+        }
+        if (!missing.empty()) {
+            std::ostringstream oss;
+            oss << "[Topology][KernelCross][FATAL] incomplete kernel_cross map; missing kernels={";
+            for (size_t i = 0; i < missing.size(); ++i) {
+                if (i) oss << ",";
+                oss << missing[i];
+            }
+            oss << "}";
+            throw std::runtime_error(oss.str());
+        }
         for (auto kn = mk.child("Kernel"); kn; kn = kn.next_sibling("Kernel")) {
             int kr = kn.attribute("rank").as_int(-1);
             if (kr < 0) continue;
@@ -2532,7 +2801,13 @@ int main(int argc, char* argv[]) {
                 }
                 MPI_Group cppGroup; MPI_Group_incl(worldGroup, (int)incl.size(), incl.data(), &cppGroup);
                 MPI_Comm newComm = MPI_COMM_NULL;
-                MPI_Comm_create_group(MPI_COMM_WORLD, cppGroup, 0, &newComm);
+                std::cout << "[CPP_ONLY_COMM][CREATE_ENTER] rank=" << rank
+                          << " members=" << formatIntList(incl)
+                          << " tag=" << CPP_ONLY_COMM_CREATE_TAG << std::endl;
+                MPI_Comm_create_group(MPI_COMM_WORLD, cppGroup, CPP_ONLY_COMM_CREATE_TAG, &newComm);
+                std::cout << "[CPP_ONLY_COMM][CREATE_EXIT] rank=" << rank
+                          << " commNull=" << (newComm == MPI_COMM_NULL ? "true" : "false")
+                          << " tag=" << CPP_ONLY_COMM_CREATE_TAG << std::endl;
                 MPI_Group_free(&cppGroup); MPI_Group_free(&worldGroup);
                 commCppOnly = newComm;
                 if (commCppOnly == MPI_COMM_NULL) {
@@ -2705,12 +2980,13 @@ int main(int argc, char* argv[]) {
                 // One-epoch-per-process support: if a kernel_cross_<date>.json exists (written by previous day),
                 // apply it for THIS epoch so connectivity/placement stays consistent without in-process epoch chaining.
                 if (!baselineFullMesh && !crossAgentRanksCfg.empty()) {
-                    try {
-                        auto k2r_now = readKernelCrossMapForDate(epochDate);
-                        if (!k2r_now.empty()) {
-                            applyKernelCrossMapToMultiKernel(rootNode, k2r_now);
-                        }
-                    } catch (...) {}
+                    auto k2r_now = readKernelCrossMapForDate(epochDate);
+                    if (epochDate != baseDate && k2r_now.empty()) {
+                        throw std::runtime_error("[Topology][KernelCross][FATAL] missing kernel_cross map for date=" + epochDate);
+                    }
+                    if (!k2r_now.empty()) {
+                        applyKernelCrossMapToMultiKernel(rootNode, k2r_now);
+                    }
                 }
                 {
                     auto ga = rootNode.child("GlobalAgentConfig");
@@ -2779,18 +3055,52 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
+                auto mkTopo = buildMultiKernelCommunicationTopology(rootNode, discoveredKernelRanks);
+                auto componentView = buildComponentCommunicationView(
+                    mkTopo, rank, simRankGlobal, /*isKernel=*/true, /*isCross=*/false, baselineFullMesh);
+                MPI_Comm componentComm = createGroupCommunicatorForMembers(componentView.members, rank);
+                if (componentComm == MPI_COMM_NULL) {
+                    std::cerr << "[FATAL][COMPONENT] rank=" << rank
+                              << " role=kernel"
+                              << " componentId=" << componentView.componentId
+                              << " members=" << formatIntList(componentView.members)
+                              << std::endl;
+                    MPI_Abort(MPI_COMM_WORLD, 93);
+                }
+                std::cout << "[TOPO][COMPONENT] rank=" << rank
+                          << " role=kernel"
+                          << " componentId=" << componentView.componentId
+                          << " kernels=" << formatIntList(componentView.kernelRanks)
+                          << " agents=" << formatIntList(componentView.agentRanks)
+                          << " cross=" << formatIntList(componentView.crossRanks)
+                          << " members=" << formatIntList(componentView.members)
+                          << std::endl;
+
                 auto __epoch_start = std::chrono::steady_clock::now();
                 auto parameters = std::make_unique<ParameterStorage>();
                 auto simulation = std::make_unique<DistributedSimulation>(parameters.get());
                 simulation->configure(rootNode, "");
                 simulation->getCommunication().setPerKernelCommunicator(perKernelComm);
-                if (epochComm != MPI_COMM_NULL) simulation->getCommunication().setSimulationCommunicator(epochComm);
-                if (!discoveredKernelRanks.empty()) {
-                    simulation->getCommunication().setKernelTargetsList(discoveredKernelRanks);
+                if (componentComm != MPI_COMM_NULL) simulation->getCommunication().setSimulationCommunicator(componentComm);
+                if (!componentView.kernelRanks.empty()) {
+                    simulation->getCommunication().setKernelTargetsList(componentView.kernelRanks);
                 }
-                if (!crossAgentRanksCfg.empty()) {
-                    simulation->getCommunication().setCrossAgentRanks(crossAgentRanksCfg);
+                std::vector<int> localKernelCrossRanks;
+                if (auto itCross = componentView.crossRanksByKernel.find(simRankGlobal);
+                    itCross != componentView.crossRanksByKernel.end()) {
+                    localKernelCrossRanks = itCross->second;
+                    std::sort(localKernelCrossRanks.begin(), localKernelCrossRanks.end());
+                    localKernelCrossRanks.erase(std::unique(localKernelCrossRanks.begin(), localKernelCrossRanks.end()),
+                                                localKernelCrossRanks.end());
                 }
+                if (!localKernelCrossRanks.empty()) {
+                    simulation->getCommunication().setCrossAgentRanks(localKernelCrossRanks);
+                }
+                std::cout << "[TOPO][DIRECT_CROSS] rank=" << rank
+                          << " role=kernel"
+                          << " kernel=" << simRankGlobal
+                          << " cross=" << formatIntList(localKernelCrossRanks)
+                          << std::endl;
 
                 // Configure + load true fundamental checkpoint for this epoch (kernel role).
                 // IMPORTANT: do this AFTER simulation->configure(), because CppAgentBatch::configure()
@@ -2861,10 +3171,21 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 simulation->setKernelRanks(neighborKernelRanks);
+                {
+                    std::ostringstream oss;
+                    oss << "[TOPO][KERNEL_NEIGHBORS] rank=" << simRankGlobal
+                        << " neighbors={";
+                    for (size_t i = 0; i < neighborKernelRanks.size(); ++i) {
+                        oss << neighborKernelRanks[i];
+                        if (i + 1 < neighborKernelRanks.size()) oss << ",";
+                    }
+                    oss << "}";
+                    std::cout << oss.str() << std::endl;
+                }
 
                 bool enableInterKernelSync = false;
-                if (discoveredKernelRanks.size() > 1) {
-                    simulation->getCommunication().createKernelOnlyCommunicator(discoveredKernelRanks);
+                if (componentView.kernelRanks.size() > 1) {
+                    simulation->getCommunication().createKernelOnlyCommunicator(componentView.kernelRanks);
                     enableInterKernelSync = true;
                 }
                 simulation->setInterKernelSyncEnabled(enableInterKernelSync);
@@ -2900,46 +3221,20 @@ int main(int argc, char* argv[]) {
                 }
 
                 size_t bytes = static_cast<size_t>(rmaWindowMB) * 1024ull * 1024ull;
-                std::unordered_map<int, std::vector<int>> crossRanksByKernel;
-                if (auto mk = rootNode.child("MultiKernel")) {
-                    for (auto kn = mk.child("Kernel"); kn; kn = kn.next_sibling("Kernel")) {
-                        int kr = kn.attribute("rank").as_int(-1);
-                        std::string crossAgents = kn.attribute("crossAgentRanks").as_string();
-                        if (kr >= 0 && !crossAgents.empty()) {
-                            std::vector<int> tmpCross;
-                            std::stringstream ssCross(crossAgents);
-                            std::string itCross;
-                            while (std::getline(ssCross, itCross, ',')) {
-                                if (!itCross.empty()) tmpCross.push_back(std::stoi(itCross));
-                            }
-                            if (!tmpCross.empty()) {
-                                crossRanksByKernel[kr] = tmpCross;
-                            }
-                        }
-                    }
-                }
+                auto crossRanksByKernel = componentView.crossRanksByKernel;
 
                 // IMPORTANT (scalability + correctness):
                 // For each kernel rank, the sender set MUST be exactly the per-kernel senders specified by MultiKernel:
                 //   Kernel@agentRanks + Kernel@crossAgentRanks
                 // No fallback to "all cross ranks" when crossAgentRanks is empty.
                 std::vector<int> mergedAgents;
-                if (auto mk = rootNode.child("MultiKernel")) {
-                    for (auto kn = mk.child("Kernel"); kn; kn = kn.next_sibling("Kernel")) {
-                        int kr = kn.attribute("rank").as_int(-1);
-                        if (kr != simRankGlobal) continue;
-                        std::string agents = kn.attribute("agentRanks").as_string();
-                        if (!agents.empty()) {
-                            std::stringstream ss(agents); std::string it;
-                            while (std::getline(ss, it, ',')) { if (!it.empty()) mergedAgents.push_back(std::stoi(it)); }
-                        }
-                        std::string crossAgents = kn.attribute("crossAgentRanks").as_string();
-                        if (!crossAgents.empty()) {
-                            std::stringstream ss2(crossAgents); std::string it2;
-                            while (std::getline(ss2, it2, ',')) { if (!it2.empty()) mergedAgents.push_back(std::stoi(it2)); }
-                        }
-                        break;
-                    }
+                if (auto itAgents = componentView.agentRanksByKernel.find(simRankGlobal);
+                    itAgents != componentView.agentRanksByKernel.end()) {
+                    mergedAgents.insert(mergedAgents.end(), itAgents->second.begin(), itAgents->second.end());
+                }
+                if (auto itCross = componentView.crossRanksByKernel.find(simRankGlobal);
+                    itCross != componentView.crossRanksByKernel.end()) {
+                    mergedAgents.insert(mergedAgents.end(), itCross->second.begin(), itCross->second.end());
                 }
                 if (mergedAgents.empty()) {
                     // Fallback to agentRanksGlobal only (no cross ranks), to avoid deadlock and keep topology sparse.
@@ -2947,10 +3242,15 @@ int main(int argc, char* argv[]) {
                 }
                 if (baselineFullMesh) {
                     // Optional legacy baseline: every kernel connects to all cross-agent ranks (full mesh).
-                    for (int cr : crossAgentRanksCfg) mergedAgents.push_back(cr);
+                    for (int cr : componentView.crossRanks) mergedAgents.push_back(cr);
                 }
                 std::sort(mergedAgents.begin(), mergedAgents.end());
                 mergedAgents.erase(std::unique(mergedAgents.begin(), mergedAgents.end()), mergedAgents.end());
+                std::vector<int> broadcastTargets = mergedAgents;
+                broadcastTargets.push_back(simRankGlobal);
+                std::sort(broadcastTargets.begin(), broadcastTargets.end());
+                broadcastTargets.erase(std::unique(broadcastTargets.begin(), broadcastTargets.end()), broadcastTargets.end());
+                simulation->setBroadcastTargetRanks(broadcastTargets);
                 simulation->enableRMAMode(bytes, simRankGlobal, mergedAgents);
 
                 size_t agentWinMB = 0;
@@ -2964,35 +3264,49 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 simulation->setRemoteWindowLayout(0, agentWinMB * 1024ull * 1024ull);
-                // Baseline full-mesh: do NOT set sparse cross-agent window topology.
-                // Leaving topology empty makes MPICommunicationManager fall back to kernelTargetsList (all kernels).
-                if (!baselineFullMesh && !crossRanksByKernel.empty()) {
-                    std::unordered_map<int, std::vector<int>> crossAgentSenders;
-                    for (const auto& kv : crossRanksByKernel) {
-                        int kernelRank = kv.first;
-                        for (int crossRank : kv.second) {
-                            crossAgentSenders[crossRank].push_back(kernelRank);
-                        }
-                    }
-                    simulation->getCommunication().setCrossAgentWindowTopology(crossAgentSenders);
+                // In full-mesh mode, componentView.crossAgentSenders already expands each cross rank
+                // to all kernels. Keep the topology explicit so kernel->cross RMA layout is valid.
+                if (!componentView.crossAgentSenders.empty()) {
+                    simulation->getCommunication().setCrossAgentWindowTopology(componentView.crossAgentSenders);
                 }
-                simulation->startCommunicationWorkers();
-                // Doorbell is ONLY used by adaptive LBTS waiting. If adaptive LBTS is disabled,
-                // completely disable any doorbell send/probe/recv logic.
-                bool enableAdaptive = true;
+                bool enableMainDoorbell = false;
+                bool enableSyncDoorbell = true;
+                unsigned int mainDoorbellSleepMicros = 1;
+                unsigned int syncDoorbellSleepMicros = 1;
                 if (auto comm = rootNode.child("CommunicationConfig")) {
-                    enableAdaptive = comm.child("EnableAdaptiveLBTS").text().as_bool(true);
+                    const bool hasMainEnable = static_cast<bool>(comm.child("EnableMainMessageDoorbell"));
+                    const bool hasMainSleep = static_cast<bool>(comm.child("MainMessageDoorbellShortSleepMicros"));
+                    const bool hasSyncEnable = static_cast<bool>(comm.child("EnableSyncDoorbell"));
+                    const bool hasSyncSleep = static_cast<bool>(comm.child("SyncDoorbellShortSleepMicros"));
+                    const bool legacyEnableSyncDoorbell = comm.child("EnableAdaptiveLBTS").text().as_bool(true);
+                    const unsigned int legacyDoorbellShortSleep = comm.child("DoorbellShortSleepMicrosKernel").text().as_uint(1);
+
+                    enableMainDoorbell = hasMainEnable
+                        ? comm.child("EnableMainMessageDoorbell").text().as_bool(false)
+                        : false;
+                    mainDoorbellSleepMicros = hasMainSleep
+                        ? comm.child("MainMessageDoorbellShortSleepMicros").text().as_uint(legacyDoorbellShortSleep)
+                        : legacyDoorbellShortSleep;
+                    enableSyncDoorbell = hasSyncEnable
+                        ? comm.child("EnableSyncDoorbell").text().as_bool(legacyEnableSyncDoorbell)
+                        : legacyEnableSyncDoorbell;
+                    syncDoorbellSleepMicros = hasSyncSleep
+                        ? comm.child("SyncDoorbellShortSleepMicros").text().as_uint(legacyDoorbellShortSleep)
+                        : legacyDoorbellShortSleep;
+                    if (mainDoorbellSleepMicros == 0) mainDoorbellSleepMicros = 1;
+                    if (syncDoorbellSleepMicros == 0) syncDoorbellSleepMicros = 1;
                 }
-                if (enableAdaptive) {
-                simulation->getCommunication().setDoorbellModeTwoSided();
-                } else {
-                    simulation->getCommunication().setDoorbellModeDisabled();
-                }
-                // One-shot diagnostics: confirm the final doorbell mode selected for this process.
+                simulation->getCommunication().setMainDoorbellEnabled(enableMainDoorbell);
+                simulation->getCommunication().setMainDoorbellShortSleepMicros(mainDoorbellSleepMicros);
+                simulation->getCommunication().setSyncDoorbellEnabled(enableSyncDoorbell);
                 std::cout << "[DOORBELL][MODE] rank=" << rank
-                          << " EnableAdaptiveLBTS=" << (enableAdaptive ? "true" : "false")
-                          << " doorbell=" << (simulation->getCommunication().isDoorbellEnabled() ? "enabled" : "disabled")
+                          << " mainEnabled=" << (enableMainDoorbell ? "true" : "false")
+                          << " mainSleepMicros=" << mainDoorbellSleepMicros
+                          << " syncEnabled=" << (enableSyncDoorbell ? "true" : "false")
+                          << " syncSleepMicros=" << syncDoorbellSleepMicros
+                          << " anyDoorbell=" << (simulation->getCommunication().isAnyDoorbellEnabled() ? "enabled" : "disabled")
                           << std::endl;
+                simulation->startCommunicationWorkers();
 
                 simulation->start();
                 if (DesmarMpiApiProfiler::Enabled()) {
@@ -3025,6 +3339,8 @@ int main(int argc, char* argv[]) {
                 // 1) barrier: ensure all ranks finished the day and flushed outputs
                 // DESMAR_MPI_MODE=proxy: stop the single MPI progress thread before entering MPI_Barrier
                 // on the main thread (keeps the "single MPI thread while running" contract).
+                // quiesce() now also drains any in-flight Iallreduce session so the epoch-local
+                // component communicator can be freed safely after object destruction.
                 {
                     const char* v = std::getenv("DESMAR_MPI_MODE");
                     bool proxy = (v && (*v=='p' || *v=='P')); // "proxy" fast check
@@ -3038,11 +3354,15 @@ int main(int argc, char* argv[]) {
 
                 // IMPORTANT:
                 // MPI windows are freed in MPICommunicationManager::~MPICommunicationManager() via shutdown().
+                // Epoch-local Iallreduce requests are also drained there before componentComm is freed.
                 // Win_free/unlock_all are collective; destroying per-epoch objects BEFORE the global barrier
                 // can make fast ranks appear "hung" waiting for slow ranks (or deadlock if some ranks never reach cleanup).
                 // Therefore, delay destruction until AFTER the barrier.
                 simulation.reset();
                 parameters.reset();
+                if (componentComm != MPI_COMM_NULL) {
+                    MPI_Comm_free(&componentComm);
+                }
 
                 // 2) rank0 merges DataFactory outputs to _merged (OHLCV+LOB) and deletes per-agent dirs
                 if (rank == 0) {
@@ -3149,12 +3469,13 @@ int main(int argc, char* argv[]) {
                 else rootNode.append_attribute("date").set_value(epochDate.c_str());
                 // One-epoch-per-process support: apply kernel_cross_<date>.json (if present) for THIS epoch.
                 if (!baselineFullMesh && !crossAgentRanksCfg.empty()) {
-                    try {
-                        auto k2r_now = readKernelCrossMapForDate(epochDate);
-                        if (!k2r_now.empty()) {
-                            applyKernelCrossMapToMultiKernel(rootNode, k2r_now);
-                        }
-                    } catch (...) {}
+                    auto k2r_now = readKernelCrossMapForDate(epochDate);
+                    if (epochDate != baseDate && k2r_now.empty()) {
+                        throw std::runtime_error("[Topology][KernelCross][FATAL] missing kernel_cross map for date=" + epochDate);
+                    }
+                    if (!k2r_now.empty()) {
+                        applyKernelCrossMapToMultiKernel(rootNode, k2r_now);
+                    }
                 }
                 {
                     auto ga = rootNode.child("GlobalAgentConfig");
@@ -3196,18 +3517,43 @@ int main(int argc, char* argv[]) {
                 auto fundamentalCfgsByAsset =
                     allgatherFundamentalCfgsFromKernels(epochComm, /*isKernel=*/false, assetNameForLogs, rootNode);
 
+                auto mkTopo = buildMultiKernelCommunicationTopology(rootNode, discoveredKernelRanks);
+                auto componentView = buildComponentCommunicationView(
+                    mkTopo, rank, simRankGlobal, /*isKernel=*/false, /*isCross=*/isCross, baselineFullMesh);
+                MPI_Comm componentComm = createGroupCommunicatorForMembers(componentView.members, rank);
+                if (componentComm == MPI_COMM_NULL) {
+                    std::cerr << "[FATAL][COMPONENT] rank=" << rank
+                              << " role=" << (isCross ? "cross" : "agent")
+                              << " componentId=" << componentView.componentId
+                              << " members=" << formatIntList(componentView.members)
+                              << std::endl;
+                    MPI_Abort(MPI_COMM_WORLD, 94);
+                }
+                std::cout << "[TOPO][COMPONENT] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent")
+                          << " componentId=" << componentView.componentId
+                          << " kernels=" << formatIntList(componentView.kernelRanks)
+                          << " agents=" << formatIntList(componentView.agentRanks)
+                          << " cross=" << formatIntList(componentView.crossRanks)
+                          << " members=" << formatIntList(componentView.members)
+                          << std::endl;
+
                 auto parameters = std::make_unique<ParameterStorage>();
                 std::string routerName = "ROUTER_RANK_" + std::to_string(rank);
                 std::unique_ptr<AgentRankRouter> router;
                 if (isCross) router = std::make_unique<CrossAgentRankRouter>(rank, routerName);
                 else router = std::make_unique<AgentRankRouter>(rank, routerName);
                 router->setSimulationRank(simRankGlobal);
-                if (epochComm != MPI_COMM_NULL) router->getCommunication().setSimulationCommunicator(epochComm);
+                if (componentComm != MPI_COMM_NULL) router->getCommunication().setSimulationCommunicator(componentComm);
+                std::cout << "[AGENT_BOOT][INIT_ENTER] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
                 if (!router->initialize()) {
                     std::cerr << "Failed to initialize router on rank " << rank << std::endl;
                     MPI_Finalize();
                     return 1;
                 }
+                std::cout << "[AGENT_BOOT][INIT_EXIT] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
 
                 auto proxySimulation = std::make_unique<ProxySimulation>(parameters.get(), router.get());
                 pugi::xml_node agentRankNode;
@@ -3399,38 +3745,54 @@ int main(int argc, char* argv[]) {
                     }
                     if (baselineFullMesh) {
                         // Optional legacy baseline: cross ranks connect to ALL kernels and every kernel accepts ALL cross ranks.
-                        kernelRanksMulti = discoveredKernelRanks;
+                        kernelRanksMulti = componentView.kernelRanks;
                         std::sort(kernelRanksMulti.begin(), kernelRanksMulti.end());
                         kernelRanksMulti.erase(std::unique(kernelRanksMulti.begin(), kernelRanksMulti.end()), kernelRanksMulti.end());
                         crossRanksByKernel.clear();
                         for (int kr : kernelRanksMulti) {
-                            crossRanksByKernel[kr] = crossAgentRanksCfg;
+                            crossRanksByKernel[kr] = componentView.crossRanks;
                         }
                     }
+                    for (auto it = crossRanksByKernel.begin(); it != crossRanksByKernel.end(); ) {
+                        if (std::find(componentView.kernelRanks.begin(), componentView.kernelRanks.end(), it->first) == componentView.kernelRanks.end()) {
+                            it = crossRanksByKernel.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    for (auto it = remoteWinByKernel.begin(); it != remoteWinByKernel.end(); ) {
+                        if (std::find(componentView.kernelRanks.begin(), componentView.kernelRanks.end(), it->first) == componentView.kernelRanks.end()) {
+                            it = remoteWinByKernel.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    std::vector<int> directCrossRanks;
+                    for (int kr : kernelRanksMulti) {
+                        auto it = crossRanksByKernel.find(kr);
+                        if (it == crossRanksByKernel.end()) continue;
+                        directCrossRanks.insert(directCrossRanks.end(), it->second.begin(), it->second.end());
+                    }
+                    std::sort(directCrossRanks.begin(), directCrossRanks.end());
+                    directCrossRanks.erase(std::unique(directCrossRanks.begin(), directCrossRanks.end()), directCrossRanks.end());
+
                     if (!kernelRanksMulti.empty()) router->getCommunication().setKernelTargetsList(kernelRanksMulti);
-                    if (!crossAgentRanksCfg.empty()) router->getCommunication().setCrossAgentRanks(crossAgentRanksCfg);
-                    {
-                        std::unordered_map<int, std::vector<int>> crossAgentSenders;
-                        if (auto mk = rootNode.child("MultiKernel")) {
-                            for (auto kn = mk.child("Kernel"); kn; kn = kn.next_sibling("Kernel")) {
-                                int kernelRank = kn.attribute("rank").as_int(-1);
-                                if (kernelRank < 0) continue;
-                                std::string crossAgents = kn.attribute("crossAgentRanks").as_string();
-                                if (crossAgents.empty()) continue;
-                                std::stringstream ss(crossAgents);
-                                std::string tok;
-                                while (std::getline(ss, tok, ',')) {
-                                    if (tok.empty()) continue;
-                                    try { int cr = std::stoi(tok); crossAgentSenders[cr].push_back(kernelRank); } catch (...) {}
-                                }
-                            }
-                        }
-                        if (!baselineFullMesh && !crossAgentSenders.empty()) {
-                            router->getCommunication().setCrossAgentWindowTopology(crossAgentSenders);
-                        }
+                    if (!directCrossRanks.empty()) router->getCommunication().setCrossAgentRanks(directCrossRanks);
+                    std::cout << "[TOPO][DIRECT_CROSS] rank=" << rank
+                              << " role=" << (isCross ? "cross" : "agent")
+                              << " kernels=" << formatIntList(kernelRanksMulti)
+                              << " cross=" << formatIntList(directCrossRanks)
+                              << std::endl;
+                    if (!componentView.crossAgentSenders.empty()) {
+                        router->getCommunication().setCrossAgentWindowTopology(componentView.crossAgentSenders);
                     }
-                    std::vector<int> mergedAgentsB = agentRanksGlobal;
-                    for (int cr : crossAgentRanksCfg) mergedAgentsB.push_back(cr);
+                    std::vector<int> mergedAgentsB;
+                    for (int kr : kernelRanksMulti) {
+                        auto it = ranksByKernel.find(kr);
+                        if (it == ranksByKernel.end()) continue;
+                        mergedAgentsB.insert(mergedAgentsB.end(), it->second.begin(), it->second.end());
+                    }
+                    for (int cr : directCrossRanks) mergedAgentsB.push_back(cr);
                     std::sort(mergedAgentsB.begin(), mergedAgentsB.end());
                     mergedAgentsB.erase(std::unique(mergedAgentsB.begin(), mergedAgentsB.end()), mergedAgentsB.end());
                     router->enableRMAMode(bytes, simRankGlobal, mergedAgentsB);
@@ -3441,6 +3803,13 @@ int main(int argc, char* argv[]) {
                         cr->setAssetKernelMapping(asset2kernel);
                         cr->setKernelRanks(kernelRanksMulti);
                         std::unordered_map<int, std::vector<int>> mergedRanksByKernel = ranksByKernel;
+                        for (auto it = mergedRanksByKernel.begin(); it != mergedRanksByKernel.end(); ) {
+                            if (std::find(componentView.kernelRanks.begin(), componentView.kernelRanks.end(), it->first) == componentView.kernelRanks.end()) {
+                                it = mergedRanksByKernel.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
                         for (const auto& kv : crossRanksByKernel) {
                             int kr = kv.first;
                             const auto& crossRanks = kv.second;
@@ -3470,7 +3839,7 @@ int main(int argc, char* argv[]) {
                     }
                     if (baselineFullMesh) {
                         // Optional legacy baseline: all kernels talk to all cross ranks (must match kernel-side RMA slice layout).
-                        myKernelCrossRanks = crossAgentRanksCfg;
+                        myKernelCrossRanks = componentView.crossRanks;
                     }
                     // IMPORTANT: do not fallback to "all cross ranks" when the kernel's crossAgentRanks is empty.
                     std::vector<int> mergedAgentsA = agentRanksGlobal;
@@ -3490,6 +3859,43 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 router->setRemoteWindowLayout(kernelWinMB * 1024ull * 1024ull, 0);
+                bool enableMainDoorbell = false;
+                bool enableSyncDoorbell = true;
+                unsigned int mainDoorbellSleepMicros = 1;
+                unsigned int syncDoorbellSleepMicros = 1;
+                if (auto comm = rootNode.child("CommunicationConfig")) {
+                    const bool hasMainEnable = static_cast<bool>(comm.child("EnableMainMessageDoorbell"));
+                    const bool hasMainSleep = static_cast<bool>(comm.child("MainMessageDoorbellShortSleepMicros"));
+                    const bool hasSyncEnable = static_cast<bool>(comm.child("EnableSyncDoorbell"));
+                    const bool hasSyncSleep = static_cast<bool>(comm.child("SyncDoorbellShortSleepMicros"));
+                    const bool legacyEnableSyncDoorbell = comm.child("EnableAdaptiveLBTS").text().as_bool(true);
+                    const unsigned int legacyDoorbellShortSleep = comm.child("DoorbellShortSleepMicrosKernel").text().as_uint(1);
+
+                    enableMainDoorbell = hasMainEnable
+                        ? comm.child("EnableMainMessageDoorbell").text().as_bool(false)
+                        : false;
+                    mainDoorbellSleepMicros = hasMainSleep
+                        ? comm.child("MainMessageDoorbellShortSleepMicros").text().as_uint(legacyDoorbellShortSleep)
+                        : legacyDoorbellShortSleep;
+                    enableSyncDoorbell = hasSyncEnable
+                        ? comm.child("EnableSyncDoorbell").text().as_bool(legacyEnableSyncDoorbell)
+                        : legacyEnableSyncDoorbell;
+                    syncDoorbellSleepMicros = hasSyncSleep
+                        ? comm.child("SyncDoorbellShortSleepMicros").text().as_uint(legacyDoorbellShortSleep)
+                        : legacyDoorbellShortSleep;
+                    if (mainDoorbellSleepMicros == 0) mainDoorbellSleepMicros = 1;
+                    if (syncDoorbellSleepMicros == 0) syncDoorbellSleepMicros = 1;
+                }
+                router->getCommunication().setMainDoorbellEnabled(enableMainDoorbell);
+                router->getCommunication().setMainDoorbellShortSleepMicros(mainDoorbellSleepMicros);
+                router->getCommunication().setSyncDoorbellEnabled(enableSyncDoorbell);
+                std::cout << "[DOORBELL][MODE] rank=" << rank
+                          << " mainEnabled=" << (enableMainDoorbell ? "true" : "false")
+                          << " mainSleepMicros=" << mainDoorbellSleepMicros
+                          << " syncEnabled=" << (enableSyncDoorbell ? "true" : "false")
+                          << " syncSleepMicros=" << syncDoorbellSleepMicros
+                          << " anyDoorbell=" << (router->getCommunication().isAnyDoorbellEnabled() ? "enabled" : "disabled")
+                          << std::endl;
                 // IMPORTANT:
                 // - In DESMAR_MPI_MODE=proxy, communicator setup MUST happen before starting MPI worker threads,
                 //   otherwise a non-MPI thread would call MPI_Comm_group/translate while the proxy MPI thread is running.
@@ -3527,11 +3933,27 @@ int main(int argc, char* argv[]) {
                 // This is especially important for cross ranks with many local agents (e.g., SPT checkpoints).
                 router->preloadLocalAgents();
 
+                std::cout << "[AGENT_BOOT][START_ENTER] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
                 router->start();
+                std::cout << "[AGENT_BOOT][START_EXIT] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
+                std::cout << "[AGENT_BOOT][READY_ENTER] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
                 router->sendReadySignalToKernel();
+                std::cout << "[AGENT_BOOT][READY_EXIT] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
+                std::cout << "[AGENT_BOOT][BARRIER_ENTER] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
                 router->getCommunication().barrierPerKernel();
+                std::cout << "[AGENT_BOOT][BARRIER_EXIT] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
                 // Run inbound message processing on the process main thread (no idle while+sleep loop).
+                std::cout << "[AGENT_BOOT][INCOMING_LOOP_ENTER] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
                 router->runIncomingLoopOnThisThread();
+                std::cout << "[AGENT_BOOT][INCOMING_LOOP_EXIT] rank=" << rank
+                          << " role=" << (isCross ? "cross" : "agent") << std::endl;
                 router->stop();
 
                 std::string alignedStatsFileAgent = commLogDirAgent + "/Aligned_time_stats_rank" + std::to_string(rank) + ".txt";
@@ -3542,11 +3964,15 @@ int main(int argc, char* argv[]) {
 
                 // IMPORTANT:
                 // Router destruction triggers MPICommunicationManager::~MPICommunicationManager() -> shutdown() -> freeWindows(),
+                // and shutdown() now drains any in-flight epoch-local Iallreduce before componentComm is freed.
                 // which calls MPI_Win_free / (optional) MPI_Win_unlock_all. These are collective operations on the window communicator.
                 // Destroying routers before the barrier can make some ranks block here while others are still simulating.
                 // Delay destruction until after the barrier.
                 router.reset();
                 parameters.reset();
+                if (componentComm != MPI_COMM_NULL) {
+                    MPI_Comm_free(&componentComm);
+                }
 
                 if (rank == 0) {
                     mergeDedupDataFactoryToMergedDir(epochDate);

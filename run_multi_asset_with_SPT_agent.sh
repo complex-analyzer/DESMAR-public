@@ -5,7 +5,7 @@ set -euo pipefail
 echo "=== multi kernel distributed simulation (HPC adaptation) started ==="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
-PROJECT_ROOT="/home/sun/Projects/DESMAR"
+PROJECT_ROOT="/home/sun/Projects/DESMAR_public_ready"
 # Multi-asset XML configuration directory.
 # Change this path if you want to run a different generated config set.
 XML_CONFIG_DIR="${XML_CONFIG_DIR:-$PROJECT_ROOT/Simulator_configs/multi_assets_SPT_agent_filled}"

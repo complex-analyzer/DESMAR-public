@@ -86,6 +86,11 @@ protected:
     // Max wall time to wait for "all expected STOP senders" before forcing STOPPED.
     // NOTE: this is a safety valve; normal shutdown should still finish via haveSeenAllExpectedStopSenders().
     unsigned int m_stopDrainMaxWaitMs{15000};
+    // Robust shutdown state:
+    // - EVENT_SHUTDOWN_STOP may arrive before EVENT_SIMULATION_STOP due to transport timing.
+    // - Do not enter STOP_DRAINING until the local stop has actually been delivered to agents.
+    std::atomic<bool> m_localSimulationStopDelivered{false};
+    std::atomic<bool> m_shutdownStopPending{false};
 
 private:
 
@@ -95,6 +100,7 @@ private:
     std::atomic<Timestamp> m_lvt{0};
 
     RouterDelayModel m_routerDelay;
+    bool m_trackWakeupInLBTS{true};
 
     bool m_debugRouterTx{true};
 
@@ -108,10 +114,10 @@ private:
     // when lookahead is zero and the router has no work at current LVT.
     std::atomic<Timestamp> m_minInboundArrival{std::numeric_limits<Timestamp>::max()};
     // While delivering an inbound message at time T to local agents, the agent may synchronously
-    // emit additional messages with arrival==T (e.g., WAKEUP -> immediate market data request).
-    // In distributed LBTS/g mode, kernel time may advance asynchronously; without a local "hold",
-    // the kernel can advance past T and later align those tight-followup messages.
-    // This value participates in agent-side LBTS reporting to conservatively "hold" g at T.
+    // emit additional outbound messages causally derived from that inbound event. The earliest
+    // externally visible arrival of such followups is bounded below by T + baseLookahead, not T
+    // itself. Track that lower bound here so LBTS does not "rollback" all the way to the raw
+    // inbound timestamp during callback execution.
     std::atomic<Timestamp> m_processingHoldArrival{std::numeric_limits<Timestamp>::max()};
     std::atomic<bool> m_lbtsThreadRunning{false};
     std::thread m_lbtsThread;
@@ -241,6 +247,8 @@ private:
     void processIncomingMessages();
     void processOutgoingMessages();
     void handleMPIMessage(std::shared_ptr<DistributedMessage> msg);
+    bool shouldTrackInflightTarget(int targetRank) const;
+    Timestamp computeProcessingHoldArrival(Timestamp inboundArrival) const;
     
 protected:
     virtual void distributeMessageToAgents(std::shared_ptr<DistributedMessage> msg);
@@ -274,10 +282,31 @@ protected:
         std::lock_guard<std::mutex> lk(m_stopSendersMutex);
         m_stopSenders.clear();
     }
+    void resetStopProtocolState() {
+        {
+            std::lock_guard<std::mutex> lk(m_stopSendersMutex);
+            m_stopSenders.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_stopAckMutex);
+            m_stopAckReceivedSent.clear();
+            m_stopAckStoppedSent.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_expectedStopSendersMutex);
+            m_expectedStopSenders.clear();
+        }
+        m_stopState.store(StopState::RUNNING, std::memory_order_relaxed);
+        m_stopDrainingStartNs.store(0, std::memory_order_relaxed);
+        m_drainRemainingMessages.store(0, std::memory_order_relaxed);
+        m_localSimulationStopDelivered.store(false, std::memory_order_relaxed);
+        m_shutdownStopPending.store(false, std::memory_order_relaxed);
+    }
 
     void ensureExpectedStopSendersInitialized();
     bool haveSeenAllExpectedStopSenders() const;
     void sendStopAckToKernel(int kernelRank, const char* ackType);
+    void tryEnterStopDraining(const char* reason);
     
 protected:
     virtual void completeDrainProcedure();

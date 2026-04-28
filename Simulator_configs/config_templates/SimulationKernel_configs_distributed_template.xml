@@ -3,7 +3,7 @@
     distributed template
     support MPI multi-process distributed architecture
 -->
-<Simulation start="09:00:00" duration="06:00:00" date="20230209">
+<Simulation start="09:00:00" duration="02:00:00" date="20230209">
     <!-- 
         time format options:
         1. time string format: "09:30:00" (recommended, most intuitive)
@@ -33,7 +33,7 @@
         <SimulationRank>0</SimulationRank>
         <AgentRanks>1,2,3,4,5</AgentRanks>
         <CrossAgentRanks>6</CrossAgentRanks>
-        <LearningRanks>7</LearningRanks>
+        <!-- <LearningRanks>7</LearningRanks> -->
     </MPIConfiguration>
 
     <!-- global Agent parameters configuration -->
@@ -51,15 +51,19 @@
         <!-- LBTS polling sleep (microseconds):
              - LBTSPollIntervalMicrosKernel: kernel-side LBTS thread fallback polling sleep (used when doorbell-adaptive LBTS is disabled / not applicable)
              - LBTSPollIntervalMicrosAgent: agent-side LBTS thread polling sleep -->
-        <LBTSPollIntervalMicrosKernel>5</LBTSPollIntervalMicrosKernel>
-        <LBTSPollIntervalMicrosAgent>5</LBTSPollIntervalMicrosAgent>
+        <LBTSPollIntervalMicrosKernel>10</LBTSPollIntervalMicrosKernel>
+        <LBTSPollIntervalMicrosAgent>10</LBTSPollIntervalMicrosAgent>
 
-        <!-- doorbell-adaptive LBTS (optional):
-             - EnableAdaptiveLBTS: enable LBTS adaptive waiting (doorbell-based wakeup + short-sleep fallback)
-             - DoorbellShortSleepMicrosKernel: LBTS thread fallback sleep when no doorbell/changes are observed
-             Note: spin/yield-based waiting was removed; tuning is mainly via DoorbellShortSleepMicrosKernel + RMAPollIntervalMicros (receiveWorker polling sleep). -->
-        <EnableAdaptiveLBTS>false</EnableAdaptiveLBTS>
-        <DoorbellShortSleepMicrosKernel>5</DoorbellShortSleepMicrosKernel>
+        <!-- doorbell controls (optional):
+             - EnableMainMessageDoorbell: enable two-sided doorbell wakeups for RMA main-message receiveWorker polling
+             - MainMessageDoorbellShortSleepMicros: receiveWorker fallback sleep when no main-message doorbell or message is observed
+             - EnableSyncDoorbell: enable two-sided doorbell wakeups for LBTS heartbeat / G publication waiting
+             - SyncDoorbellShortSleepMicros: LBTS thread fallback sleep when no sync doorbell / window change is observed
+             Note: spin/yield-based waiting was removed; tuning is mainly via the two short-sleep knobs plus RMAPollIntervalMicros. -->
+        <EnableMainMessageDoorbell>false</EnableMainMessageDoorbell>
+        <MainMessageDoorbellShortSleepMicros>10</MainMessageDoorbellShortSleepMicros>
+        <EnableSyncDoorbell>false</EnableSyncDoorbell>
+        <SyncDoorbellShortSleepMicros>10</SyncDoorbellShortSleepMicros>
 
         <!-- kernel-to-kernel LBTS lookahead (nanoseconds).
              This parameter provides a fixed positive lookahead between simulation kernels,
@@ -75,7 +79,8 @@
         <RMAPollIntervalMicros>5</RMAPollIntervalMicros>
         <!-- RMA send backoff upper limit (microseconds). After reaching the upper limit, continue to wait at a fixed interval until there is an empty position. Default 200. -->
         <RMAPutBackoffMicrosMax>200</RMAPutBackoffMicrosMax>
-        <!-- Whether to enable the lock_all mode of RMA (default false). After enabling, use lock_all instead of per-message per-target lock to improve concurrency throughput. -->
+        <!-- Whether to enable the lock_all mode of RMA (default false). After enabling, use lock_all instead of per-message per-target lock to improve concurrency throughput.
+             IMPORTANT: when RMALockAll=false, the program currently requires DESMAR_MPI_MODE=proxy. The combination DESMAR_MPI_MODE=multiple + RMALockAll=false is unsupported and may fail/hang. -->
         <RMALockAll>true</RMALockAll>
         <!-- debug/statistics log configuration items -->
         <!-- safe step (LBTS) statistics log:

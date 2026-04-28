@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CppCrossTradingAgent.h"
+#include "CrossWakeupScheduler.h"
 #include <string>
 #include <unordered_map>
 #include <set>
@@ -44,6 +45,7 @@ public:
     void preload() override;
     void handleSimulationStart() override;
     void handleSimulationStop() override;
+    void onFinalDrainCompleted() override;
     void receiveMessage(const MessagePtr& msg) override;
     void handleWakeup() override;
 
@@ -75,20 +77,22 @@ public:
     std::shared_ptr<MarketData::L2Data> getLatestL2Copy(const std::string& asset) const;
 
 protected:
+    std::vector<std::string> connectedAssetsForLocalTopology() const;
     void processStartForCurrentKernel();
     void processWakeForCurrentKernel();
     void handleTradeEventDataFactory(const MessagePtr& msg);
+    void syncWakeupSchedulerConfig();
 
-    void scheduleNextWakeupForCurrentKernelWithRoundTarget();
-    void establishRoundTargetWakeupTimestamp();
-    Timestamp calcNextRoundTargetTimestamp() const;
     void rebuildKernelsFromAssetMap();
     std::vector<std::string> assetsForCurrentKernelStrict() const { return assetsForCurrentKernel(); }
     void subscribeAllAssetsTradeEvents();
     void handleResponseRetrieveL2Data(const MessagePtr& msg);
 
     void initializeOhlcvFromExistingFiles();
+    void updateOhlcvWithTrade(const std::string& asset, const TradeRecord& tr);
+    void fillOhlcvGapsTo(std::vector<OhlcvBar>& bars, Timestamp interval, Timestamp targetBarStartExclusive) const;
     void processAndPersistOhlcvIfNeeded();
+    void scheduleNextWakeupRound(Timestamp scheduleBase, Timestamp dispatchNow, int currentRoundIndex);
     static std::string formatDateYYYYMMDD(Timestamp nsTimestamp);
     static Timestamp intervalNsFromMinutes(int minutes);
     std::string ohlcvOutputDir() const;
@@ -131,6 +135,10 @@ protected:
     std::unordered_map<std::string, Timestamp> m_last_lob_snapshot_ts_by_asset;
     std::unordered_map<std::string, std::vector<std::pair<Timestamp, std::shared_ptr<MarketData::L2Data>>>> m_l2_timeline_by_asset;
 
+    CrossWakeupScheduler m_wakeup_scheduler;
+    unsigned int m_scheduler_seed{0};
+    int m_current_step_round_index{-1};
+
     std::string lobCsvPath(const std::string& asset, const std::string& yyyymmdd) const;
     void loadLobCsv(const std::string& path, std::vector<LobSnapshotRow>& out, int& outDepth);
     void appendLobCsvRange(const std::string& path, const std::vector<LobSnapshotRow>& rows, size_t startIndex, size_t endIndexExclusive, int depth);
@@ -139,5 +147,3 @@ protected:
     void processAndPersistLobIfNeeded();
     void flushPendingLobToDisk();
 };
-
-

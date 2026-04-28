@@ -126,9 +126,11 @@ void CrossAgentRankRouter::distributeMessageToAgents(std::shared_ptr<Distributed
         } else {
             (*gp)["kernel"] = std::to_string(msg->sourceRank);
         }
-        // std::cout << "[CrossRouter][Inject] rank=" << getRank()
-        //           << " type=" << msg->type
-        //           << " sourceKernel=" << msg->sourceRank << std::endl;
+        if (msg->type == "EVENT_SIMULATION_START") {
+            std::cout << "[CrossRouter][RecvStart] rank=" << getRank()
+                      << " sourceKernel=" << msg->sourceRank
+                      << " arrival=" << msg->arrival << std::endl;
+        }
     }
     AgentRankRouter::distributeMessageToAgents(msg);
 }

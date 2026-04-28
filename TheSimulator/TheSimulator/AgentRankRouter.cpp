@@ -15,6 +15,12 @@
 #include <chrono>
 #include "MPIAPIProfiler.h"
 
+namespace {
+bool isWakeupMessageType(const std::string& type) {
+    return type == "WAKEUP" || type == "WAKEUP_FOR_IMPACT" || type == "WAKEUP_FOR_REPLAY";
+}
+} // namespace
+
 AgentRankRouter::AgentRankRouter(int rank, const std::string& routerName)
     : m_rank(rank), m_simulationRank(0), m_routerName(routerName), m_running(false), m_stopState(StopState::RUNNING) {
     
@@ -40,11 +46,19 @@ bool AgentRankRouter::initialize() {
 }
 
 void AgentRankRouter::configureDelayFromConfig(const pugi::xml_node& agentRankNode, const pugi::xml_node& rootNode) {
+    if (auto comm = rootNode.child("CommunicationConfig")) {
+        m_trackWakeupInLBTS = comm.child("TrackWakeupInLBTS").text().as_bool(true);
+    } else {
+        m_trackWakeupInLBTS = true;
+    }
+
     auto delay = agentRankNode.child("RouterDelayConfig");
     if (!delay) {
         unsigned int seed = rootNode.child("GlobalAgentConfig").child("GlobalSeed").attribute("value").as_uint(1);
         m_routerDelay.configure(false, 0, false, 0, 0, seed);
-        std::cout << "Agent rank " << m_rank << " RouterDelayConfig: not found, disabled" << std::endl;
+        std::cout << "Agent rank " << m_rank << " RouterDelayConfig: not found, disabled"
+                  << ", trackWakeupInLBTS=" << (m_trackWakeupInLBTS ? "true" : "false")
+                  << std::endl;
         return;
     }
 
@@ -65,10 +79,12 @@ void AgentRankRouter::configureDelayFromConfig(const pugi::xml_node& agentRankNo
               << ", defaultNoise=" << defLat
               << ", maxNoiseValue=" << maxNoise
               << ", seed=" << seed
+              << ", trackWakeupInLBTS=" << (m_trackWakeupInLBTS ? "true" : "false")
               << std::endl;
 }
 
 void AgentRankRouter::start() {
+    resetStopProtocolState();
     m_running = true;
     
     // Inbound processing is run on the caller thread (process main thread) by DistributedMain.cpp.
@@ -344,16 +360,44 @@ void AgentRankRouter::sendMessageToSimulation(std::shared_ptr<DistributedMessage
         msg->sequence = m_nextSequence++;
         // Apply router delay at enqueue time so queue ordering/LBTS uses FINAL arrival.
         // Control messages must NOT be delayed (startup/shutdown/ACK correctness).
-        // WAKEUP is NOT treated as control here; it should follow RouterDelayModel so that
-        // BaseLookaheadNs remains a valid lower bound and avoids late/aligned messages on kernel.
+        // WAKEUP is always a 0-delay scheduler message with respect to RouterDelay:
+        // - TrackWakeupInLBTS=true: tracked in LBTS/inflight, but no +BaseLookaheadNs.
+        // - TrackWakeupInLBTS=false: treated as control and excluded from LBTS.
         const bool isCtrl =
             isControlMessage(msg) ||
+            isWakeupMessageType(msg->type) ||
             (msg->type == "EVENT_SIMULATION_START") ||
-            (msg->type == "EVENT_SIMULATION_STOP");
+            (msg->type == "EVENT_SIMULATION_STOP") ||
+            (msg->type == "EVENT_SHUTDOWN_STOP");
         msg->arrival = m_routerDelay.apply(msg->arrival, /*skipDelayForControl*/ isCtrl);
         m_outgoingQueue.push(msg);
     }
     m_outQueueCV.notify_one();
+}
+
+bool AgentRankRouter::shouldTrackInflightTarget(int targetRank) const {
+    if (targetRank < 0) {
+        return false;
+    }
+    if (!m_mpiManager) {
+        return targetRank == m_simulationRank;
+    }
+    auto kernelTargets = m_mpiManager->getKernelTargetsOrSim();
+    return std::find(kernelTargets.begin(), kernelTargets.end(), targetRank) != kernelTargets.end();
+}
+
+Timestamp AgentRankRouter::computeProcessingHoldArrival(Timestamp inboundArrival) const {
+    if (inboundArrival == std::numeric_limits<Timestamp>::max()) {
+        return inboundArrival;
+    }
+    Timestamp lookahead = m_routerDelay.base();
+    if (lookahead == 0) {
+        return inboundArrival;
+    }
+    if (inboundArrival > std::numeric_limits<Timestamp>::max() - lookahead) {
+        return std::numeric_limits<Timestamp>::max();
+    }
+    return inboundArrival + lookahead;
 }
 
 void AgentRankRouter::routeMessageToAgent(const std::string& agentName, std::shared_ptr<DistributedMessage> msg) {
@@ -372,7 +416,9 @@ void AgentRankRouter::handleMPIMessage(std::shared_ptr<DistributedMessage> msg) 
     {
         std::lock_guard<std::mutex> lock(m_inQueueMutex);
         if (msg && (msg->type == "ACK_ENQUEUED" || isControlMessage(msg) ||
-                    msg->type == "EVENT_SIMULATION_START" || msg->type == "EVENT_SIMULATION_STOP")) {
+                    msg->type == "EVENT_SIMULATION_START" ||
+                    msg->type == "EVENT_SIMULATION_STOP" ||
+                    msg->type == "EVENT_SHUTDOWN_STOP")) {
             m_controlQueue.push_back(msg);
         } else {
             m_incomingQueue.push(msg);
@@ -466,10 +512,12 @@ void AgentRankRouter::processIncomingMessages() {
                     if (gg > cur) m_lvt.store(gg, std::memory_order_relaxed);
                 }
             }
-            // Hold at the inbound message arrival while local agents are executing callbacks.
-            // This prevents kernel g from advancing past a "tight-followup" timestamp where agents
-            // may emit additional messages with the exact same arrival (e.g., WAKEUP->RETRIEVE_L1_DATA).
-            ScopedProcessingHold hold(this, msg ? msg->arrival : std::numeric_limits<Timestamp>::max());
+            // Hold at the earliest externally visible followup time while callbacks run.
+            // Normal outbound messages to kernels are still delayed by base lookahead, so clamping
+            // all the way back to raw inbound time T is stronger than necessary and can introduce
+            // avoidable LBTS rollback-like behavior.
+            ScopedProcessingHold hold(this, computeProcessingHoldArrival(
+                msg ? msg->arrival : std::numeric_limits<Timestamp>::max()));
             distributeMessageToAgents(msg);
         }
     };
@@ -610,8 +658,9 @@ void AgentRankRouter::processOutgoingMessages() {
                 msg->sequence = 0;
             }
 
-            // Track inflight for ACK_ENQUEUED cleanup (normal messages to kernel only).
-            if (msg && msg->targetRank == m_simulationRank && msg->sequence != 0 && !isControlMessage(msg)) {
+            // Track inflight for ACK_ENQUEUED cleanup for every related kernel target.
+            if (msg && shouldTrackInflightTarget(msg->targetRank) &&
+                msg->sequence != 0 && !isControlMessage(msg)) {
                 std::lock_guard<std::mutex> g(m_inflightMutex);
                 m_inflightSeqToArrival[msg->sequence] = msg->arrival;
             }
@@ -671,11 +720,30 @@ void AgentRankRouter::startLBTSThread() {
 	m_lbtsThreadRunning = true;
 	m_lbtsThread = std::thread([this]() {
         DesmarMpiApiProfiler::RegisterThreadLabel("agent.lbtsThread");
-        // For Iallreduce baseline (non-proxy / legacy), keep a thread-local request state.
-        MPI_Request req = MPI_REQUEST_NULL;
-        uint64_t sendVal = 0;
-        uint64_t recvVal = 0;
 		while (m_lbtsThreadRunning.load()) {
+            if (m_mpiManager &&
+                m_mpiManager->isLBTSSyncIallreduce() &&
+                m_mpiManager->isIallreduceShutdownRequested()) {
+                MPI_Comm comm = m_mpiManager->getSimulationCommunicator();
+                if (comm == MPI_COMM_NULL) comm = MPI_COMM_WORLD;
+                bool shutdownMatched = false;
+                if (m_mpiManager->isProxyThreadModeEnabled()) {
+                    m_mpiManager->proxyIallreduceSubmit(0, comm);
+                    uint64_t gg = UINT64_MAX;
+                    if (m_mpiManager->proxyIallreduceTryConsume(gg, shutdownMatched) &&
+                        shutdownMatched) {
+                        break;
+                    }
+                } else {
+                    uint64_t gg = UINT64_MAX;
+                    if (m_mpiManager->advanceIallreduce(0, comm, gg, shutdownMatched) &&
+                        shutdownMatched) {
+                        break;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(m_lbtsPollIntervalMicrosAgent));
+                continue;
+            }
 			if (m_debugLBTS) { m_lbtsPerf.iters.fetch_add(1, std::memory_order_relaxed); }
 			if (!m_lbtsQuiesce.load(std::memory_order_relaxed)) {
 				Timestamp lvt = m_lvt.load(std::memory_order_relaxed);
@@ -728,24 +796,25 @@ void AgentRankRouter::startLBTSThread() {
                             // PROXY: submit/poll via MPICommunicationManager (single MPI thread owns the Iallreduce request).
                             m_mpiManager->proxyIallreduceSubmit(v, comm);
                             uint64_t gg = 0;
-                            if (m_mpiManager->proxyIallreduceTryConsume(gg)) {
+                            bool shutdownMatched = false;
+                            if (m_mpiManager->proxyIallreduceTryConsume(gg, shutdownMatched)) {
+                                if (shutdownMatched) {
+                                    break;
+                                }
                                 if (gg == UINT64_MAX) gg = 0ull;
                                 m_globalLBTS.store(static_cast<Timestamp>(gg), std::memory_order_relaxed);
                             }
                         } else {
-                            // MULTIPLE (legacy): original per-thread Iallreduce state machine.
-                        sendVal = v;
-                        if (req == MPI_REQUEST_NULL) {
-                            MPI_Iallreduce(&sendVal, &recvVal, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm, &req);
-                        } else {
-                            int done = 0;
-                            MPI_Test(&req, &done, MPI_STATUS_IGNORE);
-                            if (done) {
-                                req = MPI_REQUEST_NULL;
-                                uint64_t g = recvVal;
+                            // MULTIPLE: reuse the manager-owned Iallreduce session so epoch-end teardown
+                            // can safely drain any in-flight collective before the communicator is freed.
+                            uint64_t g = 0;
+                            bool shutdownMatched = false;
+                            if (m_mpiManager->advanceIallreduce(v, comm, g, shutdownMatched)) {
+                                if (shutdownMatched) {
+                                    break;
+                                }
                                 if (g == UINT64_MAX) g = 0ull;
                                 m_globalLBTS.store(static_cast<Timestamp>(g), std::memory_order_relaxed);
-                                }
                             }
                         }
                     } else {
@@ -794,6 +863,16 @@ void AgentRankRouter::startLBTSThread() {
 
 void AgentRankRouter::stopLBTSThread() {
     if (!m_lbtsThreadRunning.load()) return;
+    if (m_mpiManager && m_mpiManager->isLBTSSyncIallreduce()) {
+        m_lbtsQuiesce.store(true, std::memory_order_release);
+        m_mpiManager->requestIallreduceShutdown();
+        if (m_lbtsThread.joinable()) {
+            m_lbtsThread.join();
+        }
+        m_mpiManager->clearIallreduceShutdownRequest();
+        m_lbtsThreadRunning = false;
+        return;
+    }
     m_lbtsThreadRunning = false;
     if (m_lbtsThread.joinable()) {
         m_lbtsThread.join();
@@ -839,7 +918,8 @@ void AgentRankRouter::distributeMessageToAgents(std::shared_ptr<DistributedMessa
     alignIncomingMessage(msg);
 
     const bool isStartMessage = (msg && msg->type == "EVENT_SIMULATION_START");
-    const bool isStopMessage  = (msg && msg->type == "EVENT_SIMULATION_STOP");
+    const bool isSimulationStopMessage = (msg && msg->type == "EVENT_SIMULATION_STOP");
+    const bool isShutdownStopMessage = (msg && msg->type == "EVENT_SHUTDOWN_STOP");
 
     if (isStartMessage) {
         bool expected = false;
@@ -855,22 +935,38 @@ void AgentRankRouter::distributeMessageToAgents(std::shared_ptr<DistributedMessa
         }
     }
 
-    if (isStopMessage) {
-        std::cout << "AgentRankRouter " << m_routerName << " received EVENT_SIMULATION_STOP, entering STOP_DRAINING state" << std::endl;
-        m_stopState.store(StopState::STOP_DRAINING, std::memory_order_relaxed);
-        // Record the wall-clock start of STOP_DRAINING once (steady clock).
-        {
-            uint64_t nowNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            uint64_t expected0 = 0;
-            (void)m_stopDrainingStartNs.compare_exchange_strong(expected0, nowNs, std::memory_order_relaxed);
-        }
+    if (isShutdownStopMessage) {
         // Remember which kernel told us to stop so we can ACK only real senders (important for cross-agent ranks).
         const int sender = msg ? msg->sourceRank : -1;
         (void)recordStopSender(sender);
         ensureExpectedStopSendersInitialized();
         // Phase-1 ACK: confirm STOP receipt immediately to the sender kernel.
         sendStopAckToKernel(sender, "ACK_STOP_RECEIVED");
+        m_shutdownStopPending.store(true, std::memory_order_release);
+        if (m_localSimulationStopDelivered.load(std::memory_order_acquire)) {
+            std::cout << "AgentRankRouter " << m_routerName
+                      << " received EVENT_SHUTDOWN_STOP after local EVENT_SIMULATION_STOP"
+                      << std::endl;
+            tryEnterStopDraining("shutdown_after_stop");
+        } else {
+            std::cout << "AgentRankRouter " << m_routerName
+                      << " received EVENT_SHUTDOWN_STOP before local EVENT_SIMULATION_STOP, deferring STOP_DRAINING"
+                      << std::endl;
+        }
+        return;
+    }
+
+    if (isSimulationStopMessage) {
+        const bool firstLocalStop = !m_localSimulationStopDelivered.exchange(true, std::memory_order_acq_rel);
+        if (!firstLocalStop) {
+            std::cout << "Agent rank " << m_rank
+                      << " received duplicate EVENT_SIMULATION_STOP, ignoring duplicate local delivery"
+                      << std::endl;
+            if (m_shutdownStopPending.load(std::memory_order_acquire)) {
+                tryEnterStopDraining("duplicate_stop_with_pending_shutdown");
+            }
+            return;
+        }
     }
     
     if (msg->targets.empty()) {
@@ -905,9 +1001,11 @@ void AgentRankRouter::distributeMessageToAgents(std::shared_ptr<DistributedMessa
         }
     }
     
-    if (isStopMessage) {
-        std::cout << "Agent rank " << m_rank << " finished distributing STOP, starting drain procedure" << std::endl;
-        startDrainProcedure();
+    if (isSimulationStopMessage) {
+        std::cout << "Agent rank " << m_rank << " finished distributing EVENT_SIMULATION_STOP to local agents" << std::endl;
+        if (m_shutdownStopPending.load(std::memory_order_acquire)) {
+            tryEnterStopDraining("stop_after_pending_shutdown");
+        }
     }
 }
 
@@ -954,9 +1052,9 @@ void AgentRankRouter::handleMessageInStopDraining(std::shared_ptr<DistributedMes
     
     const std::string& type = msg->type;
     
-    if (type == "EVENT_SIMULATION_STOP") {
-        // Multiple kernels may send STOP to the same (cross) agent rank.
-        // Even during STOP_DRAINING we must record all STOP senders so we can ACK each kernel.
+    if (type == "EVENT_SHUTDOWN_STOP") {
+        // Multiple kernels may send shutdown control to the same (cross) agent rank.
+        // Even during STOP_DRAINING we must record all shutdown senders so we can ACK each kernel.
         const int sender = msg->sourceRank;
         bool first = recordStopSender(sender);
         ensureExpectedStopSendersInitialized();
@@ -981,13 +1079,34 @@ void AgentRankRouter::startDrainProcedure() {
               << m_drainRemainingMessages.load(std::memory_order_relaxed) << std::endl;
 }
 
+void AgentRankRouter::tryEnterStopDraining(const char* reason) {
+    StopState expected = StopState::RUNNING;
+    if (!m_stopState.compare_exchange_strong(expected, StopState::STOP_DRAINING, std::memory_order_acq_rel)) {
+        return;
+    }
+    uint64_t nowNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    uint64_t expected0 = 0;
+    (void)m_stopDrainingStartNs.compare_exchange_strong(expected0, nowNs, std::memory_order_relaxed);
+    std::cout << "Agent rank " << m_rank << " entering STOP_DRAINING";
+    if (reason && *reason) {
+        std::cout << " reason=" << reason;
+    }
+    std::cout << std::endl;
+    startDrainProcedure();
+}
+
 bool AgentRankRouter::isControlMessage(std::shared_ptr<DistributedMessage> msg) const {
     if (!msg) return false;
     
     const std::string& type = msg->type;
+    if (isWakeupMessageType(type)) {
+        return !m_trackWakeupInLBTS;
+    }
     return (type == "ACK_STOP" ||
             type == "ACK_STOP_RECEIVED" ||
             type == "ACK_STOPPED" ||
+            type == "EVENT_SHUTDOWN_STOP" ||
             type == "ACK_ENQUEUED" ||
             type == "AGENT_RANK_READY" ||
             type.find("ACK_") == 0);
@@ -1016,8 +1135,9 @@ void AgentRankRouter::completeDrainProcedure() {
     try {
         auto senders = snapshotStopSenders();
         if (senders.empty()) {
-            // Legacy fallback: if we never recorded a sender, assume configured simulation rank.
-            senders.push_back(m_simulationRank);
+            std::cerr << "[STOP_ACK][WARN] rank=" << m_rank
+                      << " no recorded shutdown sender; skipping ACK_STOPPED send"
+                      << std::endl;
         }
         for (int kr : senders) {
             sendStopAckToKernel(kr, "ACK_STOPPED");
@@ -1026,18 +1146,26 @@ void AgentRankRouter::completeDrainProcedure() {
         std::cerr << "Agent rank " << m_rank << " failed to send ACK_STOPPED: " << e.what() << std::endl;
     }
 
-    if (m_mpiManager) {
-        auto snap = m_mpiManager->snapshotStopMailboxLocal();
-        std::cout << "[STOP_MAILBOX][SNAP] rank=" << m_rank
-                  << " slices=" << snap.slices
-                  << " cmdVerNonZero=" << snap.stopCmdVerNonZero
-                  << " cmdStop=" << snap.stopCmdIsStop
-                  << " cmdMaxVer=" << snap.stopCmdMaxVer
-                  << " stateVerNonZero=" << snap.stopStateVerNonZero
-                  << " stateStopped=" << snap.stopStateIsStopped
-                  << " stateMaxVer=" << snap.stopStateMaxVer
-                  << std::endl;
+    // Final persistence may touch a shared filesystem and can be slow at scale.
+    // Do it after ACK_STOPPED so kernels are not aborted by the STOP ACK timeout,
+    // while still preserving correctness because all inbound messages have been drained.
+    for (auto& agent : m_localAgents) {
+        if (!agent) continue;
+        try {
+            agent->onFinalDrainCompleted();
+        } catch (const std::exception& e) {
+            std::cerr << "[FinalDrain][ERR] rank=" << m_rank
+                      << " agent=" << agent->name()
+                      << " err=" << e.what()
+                      << std::endl;
+        } catch (...) {
+            std::cerr << "[FinalDrain][ERR] rank=" << m_rank
+                      << " agent=" << agent->name()
+                      << " err=unknown"
+                      << std::endl;
+        }
     }
+
 }
 
 void AgentRankRouter::ensureExpectedStopSendersInitialized() {
@@ -1053,7 +1181,10 @@ void AgentRankRouter::ensureExpectedStopSendersInitialized() {
         // Therefore:
         // - If main transport is two-sided OR LBTS sync is two-sided/iallreduce, use the configured kernel target set.
         // - Otherwise (pure RMA), keep the original slice-based expectation.
-        if (m_mpiManager->isMainCommTwoSided() || m_mpiManager->isLBTSSyncTwoSided() || m_mpiManager->isLBTSSyncIallreduce()) {
+        if (m_mpiManager->isShutdownControlTwoSided() ||
+            m_mpiManager->isMainCommTwoSided() ||
+            m_mpiManager->isLBTSSyncTwoSided() ||
+            m_mpiManager->isLBTSSyncIallreduce()) {
             auto targets = m_mpiManager->getKernelTargetsOrSim();
             for (int r : targets) if (r >= 0) m_expectedStopSenders.insert(r);
         } else if (m_mpiManager->isRMAMode()) {
@@ -1100,12 +1231,8 @@ void AgentRankRouter::sendStopAckToKernel(int kernelRank, const char* ackType) {
     ackDistMsg->sourceRank = m_rank;
     ackDistMsg->targetRank = kernelRank;
 
-    // Also publish STOP state via RMA mailbox (does not depend on ring queue space).
-    if (t == "ACK_STOP_RECEIVED") {
-        m_mpiManager->rmaWriteStopStateToKernel(kernelRank, /*state*/1);
-    } else if (t == "ACK_STOPPED") {
-        m_mpiManager->rmaWriteStopStateToKernel(kernelRank, /*state*/2);
-    }
+    // Shutdown control is carried by the dedicated two-sided control path; avoid
+    // opening extra RMA mailbox epochs during teardown.
 
     const bool isStoppedAck = (t == "ACK_STOPPED");
     size_t qBefore = 0;

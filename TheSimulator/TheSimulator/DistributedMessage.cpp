@@ -328,7 +328,7 @@ void DistributedMessage::serializePayload(std::stringstream& ss) const {
             ss << "WakeupEmpty|";
         }
     }
-    else if (type == "EVENT_SIMULATION_START" || type == "EVENT_SIMULATION_STOP") {
+    else if (type == "EVENT_SIMULATION_START" || type == "EVENT_SIMULATION_STOP" || type == "EVENT_SHUTDOWN_STOP") {
         ss << "SimulationEvent|";
     }
     

@@ -51,15 +51,19 @@
         <!-- LBTS polling sleep (microseconds):
              - LBTSPollIntervalMicrosKernel: kernel-side LBTS thread fallback polling sleep (used when doorbell-adaptive LBTS is disabled / not applicable)
              - LBTSPollIntervalMicrosAgent: agent-side LBTS thread polling sleep -->
-        <LBTSPollIntervalMicrosKernel>5</LBTSPollIntervalMicrosKernel>
-        <LBTSPollIntervalMicrosAgent>5</LBTSPollIntervalMicrosAgent>
+        <LBTSPollIntervalMicrosKernel>10</LBTSPollIntervalMicrosKernel>
+        <LBTSPollIntervalMicrosAgent>10</LBTSPollIntervalMicrosAgent>
 
-        <!-- doorbell-adaptive LBTS (optional):
-             - EnableAdaptiveLBTS: enable LBTS adaptive waiting (doorbell-based wakeup + short-sleep fallback)
-             - DoorbellShortSleepMicrosKernel: LBTS thread fallback sleep when no doorbell/changes are observed
-             Note: spin/yield-based waiting was removed; tuning is mainly via DoorbellShortSleepMicrosKernel + RMAPollIntervalMicros (receiveWorker polling sleep). -->
-        <EnableAdaptiveLBTS>false</EnableAdaptiveLBTS>
-        <DoorbellShortSleepMicrosKernel>5</DoorbellShortSleepMicrosKernel>
+        <!-- doorbell controls (optional):
+             - EnableMainMessageDoorbell: enable two-sided doorbell wakeups for RMA main-message receiveWorker polling
+             - MainMessageDoorbellShortSleepMicros: receiveWorker fallback sleep when no main-message doorbell or message is observed
+             - EnableSyncDoorbell: enable two-sided doorbell wakeups for LBTS heartbeat / G publication waiting
+             - SyncDoorbellShortSleepMicros: LBTS thread fallback sleep when no sync doorbell / window change is observed
+             Note: spin/yield-based waiting was removed; tuning is mainly via the two short-sleep knobs plus RMAPollIntervalMicros. -->
+        <EnableMainMessageDoorbell>false</EnableMainMessageDoorbell>
+        <MainMessageDoorbellShortSleepMicros>10</MainMessageDoorbellShortSleepMicros>
+        <EnableSyncDoorbell>false</EnableSyncDoorbell>
+        <SyncDoorbellShortSleepMicros>10</SyncDoorbellShortSleepMicros>
 
         <!-- kernel-to-kernel LBTS lookahead (nanoseconds).
              This parameter provides a fixed positive lookahead between simulation kernels,
@@ -161,7 +165,7 @@
             name="ORDER_LOG_AGENT"
             flushImmediately="false"
             logToConsole="true"
-            outputFile="/home/sun/Projects/DESMAR/data/agent_outputs/OrderActionLogAgent/"
+            outputFile="/home/sun/Projects/DESMAR_public_ready/data/agent_outputs/OrderActionLogAgent/"
             />
 
         <!-- simple single impact agent example - need to explicitly specify name to avoid duplication -->
@@ -254,7 +258,7 @@
             resetThreshold="0.1"
             deterministicInference="false"
             rewardWakeMultiplier="1"
-            hierarchicalDecision="false"
+            hierarchicalDecision="true"
             tradeTimesBetweenWakeup="5"
             commissionLambda="0.002"
             bdqSaveExecutionStats="false"
@@ -294,7 +298,7 @@
             resetThreshold="0.1"
             deterministicInference="false"
             rewardWakeMultiplier="1"
-            hierarchicalDecision="false"
+            hierarchicalDecision="true"
             tradeTimesBetweenWakeup="5"
             commissionLambda="0.002"
             bdqSaveExecutionStats="false"
@@ -334,7 +338,7 @@
             resetThreshold="0.1"
             deterministicInference="false"
             rewardWakeMultiplier="1"
-            hierarchicalDecision="false"
+            hierarchicalDecision="true"
             tradeTimesBetweenWakeup="5"
             commissionLambda="0.002"
             bdqSaveExecutionStats="false"

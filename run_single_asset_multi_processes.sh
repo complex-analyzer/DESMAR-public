@@ -161,7 +161,7 @@ CONFIG_FILE=$(realpath "$CONFIG_FILE")
 # This script launches only `distributed_simulator` and does not start Python learner_mpi.py.
 # Therefore we also clear <LearningRanks> to prevent accidental learner-enabled MPMD path.
 if [ "$DISABLE_CROSS" = true ]; then
-    PROJECT_ROOT="/home/sun/Projects/DESMAR"
+    PROJECT_ROOT="/home/sun/Projects/DESMAR_public_ready"
     TMP_DIR="$PROJECT_ROOT/.tmp_configs"
     mkdir -p "$TMP_DIR"
     BASENAME=$(basename "$CONFIG_FILE")
@@ -306,7 +306,7 @@ echo "detected Torch library directory: $TORCH_LIB_DIR"
 
 # Also include build-time shared libs (e.g. Mt-KaHyPar) when running from the build tree.
 # NOTE: Our CMake sets CMAKE_SKIP_RPATH=TRUE, so the executable does not embed an RPATH to find libmtkahypar.so.
-PROJECT_ROOT="/home/sun/Projects/DESMAR"
+PROJECT_ROOT="/home/sun/Projects/DESMAR_public_ready"
 MTKAHYPAR_LIB_DIR="$PROJECT_ROOT/build/mt-kahypar-build/lib"
 
 # Build minimal runtime LD_LIBRARY_PATH (Torch first, then Mt-KaHyPar, then keep existing)

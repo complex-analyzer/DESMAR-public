@@ -15,6 +15,12 @@
 #include <fstream>
 #include "MPIAPIProfiler.h"
 
+namespace {
+bool isWakeupMessageTypeForLBTS(const std::string& type) {
+    return type == "WAKEUP" || type == "WAKEUP_FOR_IMPACT" || type == "WAKEUP_FOR_REPLAY";
+}
+} // namespace
+
 RoutingDecision MessageRouter::routeMessage(const MessagePtr& msg) {
     RoutingDecision decision;
     
@@ -22,6 +28,15 @@ RoutingDecision MessageRouter::routeMessage(const MessagePtr& msg) {
         if (target == "*") {
             decision.targetRanks = getAllAgentRanks();
             decision.targetRanks.insert(m_registry->getSimulationRank());
+            if (!m_broadcastTargetRanks.empty()) {
+                for (auto it = decision.targetRanks.begin(); it != decision.targetRanks.end(); ) {
+                    if (m_broadcastTargetRanks.find(*it) == m_broadcastTargetRanks.end()) {
+                        it = decision.targetRanks.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             decision.routingType = RoutingType::BROADCAST;
         }
         else if (target.back() == '*') {
@@ -57,6 +72,13 @@ std::set<int> MessageRouter::getAllAgentRanks() const {
     return all;
 }
 
+void MessageRouter::setBroadcastTargetRanks(const std::vector<int>& ranks) {
+    m_broadcastTargetRanks.clear();
+    for (int r : ranks) {
+        if (r >= 0) m_broadcastTargetRanks.insert(r);
+    }
+}
+
 DistributedSimulation::DistributedSimulation(ParameterStorage* parameters)
     : Simulation(parameters), m_simulation_running(false), 
       m_readyAgentRanks(0), m_allRanksReady(false), m_expectedAgentRanks(0) {
@@ -81,7 +103,7 @@ void DistributedSimulation::initializeDistributedComponents() {
     
     m_timeAlignmentManager = std::make_unique<TimeAlignmentManager>();
     
-    std::cout << "DistributedSimulation asynchronous single-sided communication components initialized" << std::endl;
+    std::cout << "DistributedSimulation distributed communication components constructed" << std::endl;
 }
 
 
@@ -95,20 +117,45 @@ void DistributedSimulation::configure(const pugi::xml_node& node, const std::str
     if (auto comm = node.child("CommunicationConfig")) {
         unsigned int lbtsMicros = comm.child("LBTSPollIntervalMicrosKernel").text().as_uint(100);
         setLBTSPollIntervalMicros(lbtsMicros);
-        m_enableAdaptiveLBTS = comm.child("EnableAdaptiveLBTS").text().as_bool(true);
         m_debugLBTS = comm.child("EnableLBTSLogKernel").text().as_bool(false);
         m_lbtsLogEveryIters = comm.child("LBTSLogEveryItersKernel").text().as_uint(1000);
-        m_doorbellShortSleepMicros = comm.child("DoorbellShortSleepMicrosKernel").text().as_uint(1);
-        // If adaptive LBTS is disabled, fully disable doorbell channel as well:
-        // no DOORBELL_TAG sends, no probing/receiving, no doorbell-driven sleeping.
-        if (!m_enableAdaptiveLBTS && m_mpiManager) {
-            m_mpiManager->setDoorbellModeDisabled();
-        }
-        // One-shot diagnostics: confirm adaptive LBTS + doorbell mode derived from config.
+
+        const bool hasMainEnable = static_cast<bool>(comm.child("EnableMainMessageDoorbell"));
+        const bool hasMainSleep = static_cast<bool>(comm.child("MainMessageDoorbellShortSleepMicros"));
+        const bool hasSyncEnable = static_cast<bool>(comm.child("EnableSyncDoorbell"));
+        const bool hasSyncSleep = static_cast<bool>(comm.child("SyncDoorbellShortSleepMicros"));
+        const bool legacyEnableSyncDoorbell = comm.child("EnableAdaptiveLBTS").text().as_bool(true);
+        const unsigned int legacyDoorbellShortSleep = comm.child("DoorbellShortSleepMicrosKernel").text().as_uint(1);
+
+        m_enableMainMessageDoorbell = hasMainEnable
+            ? comm.child("EnableMainMessageDoorbell").text().as_bool(false)
+            : false;
+        m_mainDoorbellShortSleepMicros = hasMainSleep
+            ? comm.child("MainMessageDoorbellShortSleepMicros").text().as_uint(legacyDoorbellShortSleep)
+            : legacyDoorbellShortSleep;
+        m_enableSyncDoorbell = hasSyncEnable
+            ? comm.child("EnableSyncDoorbell").text().as_bool(legacyEnableSyncDoorbell)
+            : legacyEnableSyncDoorbell;
+        m_syncDoorbellShortSleepMicros = hasSyncSleep
+            ? comm.child("SyncDoorbellShortSleepMicros").text().as_uint(legacyDoorbellShortSleep)
+            : legacyDoorbellShortSleep;
+        if (m_mainDoorbellShortSleepMicros == 0) m_mainDoorbellShortSleepMicros = 1;
+        if (m_syncDoorbellShortSleepMicros == 0) m_syncDoorbellShortSleepMicros = 1;
+        m_trackWakeupInLBTS = comm.child("TrackWakeupInLBTS").text().as_bool(true);
+
         if (m_mpiManager) {
+            m_mpiManager->setMainDoorbellEnabled(m_enableMainMessageDoorbell);
+            m_mpiManager->setMainDoorbellShortSleepMicros(m_mainDoorbellShortSleepMicros);
+            m_mpiManager->setSyncDoorbellEnabled(m_enableSyncDoorbell);
             std::cout << "[DOORBELL][CFG] rank=" << m_registry->getLocalRank()
-                      << " EnableAdaptiveLBTS=" << (m_enableAdaptiveLBTS ? "true" : "false")
-                      << " doorbell=" << (m_mpiManager->isDoorbellEnabled() ? "enabled" : "disabled")
+                      << " mainEnabled=" << (m_enableMainMessageDoorbell ? "true" : "false")
+                      << " mainSleepMicros=" << m_mainDoorbellShortSleepMicros
+                      << " syncEnabled=" << (m_enableSyncDoorbell ? "true" : "false")
+                      << " syncSleepMicros=" << m_syncDoorbellShortSleepMicros
+                      << " anyDoorbell=" << (m_mpiManager->isAnyDoorbellEnabled() ? "enabled" : "disabled")
+                      << " trackWakeupInLBTS=" << (m_trackWakeupInLBTS ? "true" : "false")
+                      << " legacyMainFallback=" << ((!hasMainEnable || !hasMainSleep) ? "true" : "false")
+                      << " legacySyncFallback=" << ((!hasSyncEnable || !hasSyncSleep) ? "true" : "false")
                       << std::endl;
         }
 
@@ -209,6 +256,12 @@ void DistributedSimulation::configure(const pugi::xml_node& node, const std::str
     }
     
     std::cout << "DistributedSimulation configured for rank " << m_registry->getLocalRank() << std::endl;
+}
+
+void DistributedSimulation::setBroadcastTargetRanks(const std::vector<int>& ranks) {
+    if (m_messageRouter) {
+        m_messageRouter->setBroadcastTargetRanks(ranks);
+    }
 }
 
 void DistributedSimulation::start() {
@@ -389,7 +442,7 @@ void DistributedSimulation::startDistributedSimulation() {
     
     m_outgoingProcessorThread = std::thread(&DistributedSimulation::processOutgoingMessages, this);
     
-    std::cout << "Asynchronous single-sided communication thread started - send thread (receive changed to main thread lookahead processing)" << std::endl;
+    std::cout << "Distributed communication send thread started - receive handled by main-thread lookahead processing" << std::endl;
 }
 
 void DistributedSimulation::stop() {
@@ -447,6 +500,11 @@ void DistributedSimulation::stop() {
     const auto communicationAgentRanks = m_mpiManager->getAgentRanks();
     {
         m_expectedStopAcks = static_cast<int>(communicationAgentRanks.size());
+        {
+            std::lock_guard<std::mutex> lk(m_stopAckMutex);
+            m_expectedStopAckRanks.clear();
+            m_expectedStopAckRanks.insert(communicationAgentRanks.begin(), communicationAgentRanks.end());
+        }
         std::cout << "[STOP] expecting ACKs from agent ranks that communicate with this kernel: " 
                   << m_expectedStopAcks << " ranks={";
         for (size_t i = 0; i < communicationAgentRanks.size(); ++i) {
@@ -456,27 +514,25 @@ void DistributedSimulation::stop() {
         std::cout << "}" << std::endl;
         
         for (int r : communicationAgentRanks) {
-            Message ctrl(currentTimestamp(), currentTimestamp(), "SIMULATION", std::vector<std::string>{"*"}, "EVENT_SIMULATION_STOP", nullptr);
+            Message ctrl(currentTimestamp(), currentTimestamp(), "SIMULATION", std::vector<std::string>{"*"}, "EVENT_SHUTDOWN_STOP", nullptr);
             auto dmsg = std::make_shared<DistributedMessage>(ctrl);
             dmsg->sourceRank = m_registry->getLocalRank();
             dmsg->targetRank = r;
             dmsg->routingType = RoutingType::DIRECT;
             if (m_enableMsgStats) { m_msgOutCount.fetch_add(1, std::memory_order_relaxed); }
             m_mpiManager->sendMessage(dmsg, r);
-            std::cout << "[STOP] sent STOP to agent rank " << r << std::endl;
+            std::cout << "[STOP] sent SHUTDOWN_STOP to agent rank " << r << std::endl;
         }
-        // Symmetric STOP mailbox (one-sided): ensures cross/agent ranks observe STOP even if ring is congested.
-        if (m_mpiManager && m_mpiManager->isRMAMode()) {
-            m_mpiManager->rmaPublishStopCommandToAgents(communicationAgentRanks);
-        }
+        // Shutdown control now uses the dedicated two-sided control path even when
+        // the main/bulk transport remains RMA. Avoid touching the RMA STOP mailbox here.
     }
     
     {
-        const int timeoutMs = 20000;
+        const int timeoutMs = 60000;
         int waited = 0;
         while (m_stopAckReceived.load(std::memory_order_relaxed) < m_expectedStopAcks && waited < timeoutMs) {
             if ((waited % 200) == 0) {
-                std::cout << "[STOP] waiting ACK_STOP: " << m_stopAckReceived.load(std::memory_order_relaxed)
+                std::cout << "[STOP] waiting ACK_STOPPED: " << m_stopAckReceived.load(std::memory_order_relaxed)
                           << "/" << m_expectedStopAcks << " (" << waited << " ms)" << std::endl;
             }
             // Ensure progress even if receive worker is not running / stalled.
@@ -485,23 +541,6 @@ void DistributedSimulation::stop() {
                 m_mpiManager->processIncomingMessages();
             }
 
-            // One-sided STOP mailbox fallback: count STOPPED agents directly from the kernel's RMA window header.
-            // This avoids deadlock when ACK_STOPPED messages are delayed/lost due to ring backpressure.
-            if (m_mpiManager && m_mpiManager->isRMAMode()) {
-                auto stopped = m_mpiManager->rmaGetStoppedAgentRanksFromLocalWindow(communicationAgentRanks);
-                for (int ar : stopped) {
-                    bool first = false;
-                    {
-                        std::lock_guard<std::mutex> lk(m_stopAckMutex);
-                        first = m_stopAckedRanks.insert(ar).second;
-                    }
-                    if (first) {
-                        int currentAcks = m_stopAckReceived.fetch_add(1, std::memory_order_relaxed) + 1;
-                        std::cout << "[STOP] received ACK_STOPPED(from mailbox) from rank " << ar
-                                  << " (" << currentAcks << "/" << m_expectedStopAcks << ")" << std::endl;
-                    }
-                }
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             waited += 10;
         }
@@ -528,7 +567,7 @@ void DistributedSimulation::shutdownThreads() {
         m_outgoingProcessorThread.join();
     }
     
-    std::cout << "Asynchronous single-sided communication thread stopped" << std::endl;
+    std::cout << "Distributed communication send thread stopped" << std::endl;
 
     if (m_rankStatsRunning.load()) {
         m_rankStatsRunning = false;
@@ -652,6 +691,20 @@ void DistributedSimulation::handleMPIMessage(std::shared_ptr<DistributedMessage>
                       << " (ignored: stop phase not started)" << std::endl;
             return;
         }
+        bool expectedSrc = false;
+        {
+            std::lock_guard<std::mutex> lk(m_stopAckMutex);
+            expectedSrc = (m_expectedStopAckRanks.find(src) != m_expectedStopAckRanks.end());
+        }
+        if (!expectedSrc) {
+            int me = m_registry ? m_registry->getLocalRank() : -1;
+            std::cout << "[STOP_ACK][UNEXPECTED] kernelRank=" << me
+                      << " <- agentRank=" << src
+                      << " type=" << (msg ? msg->type : std::string("ACK_STOP?"))
+                      << " (ignored: not in expected ACK set)"
+                      << std::endl;
+            return;
+        }
         // Phase-1 ACK (RECEIVED) is diagnostic only; do not count toward stop completion.
         if (msg && msg->type == "ACK_STOP_RECEIVED") {
             return;
@@ -713,7 +766,8 @@ void DistributedSimulation::enqueueIncomingMessage(std::shared_ptr<DistributedMe
         std::lock_guard<std::mutex> lock(m_incomingQueueMutex);
         m_incomingMessageQueue.push(msg);
     }
-    if (arr != std::numeric_limits<Timestamp>::max()) {
+    const bool trackInLBTS = msg && (!isWakeupMessageTypeForLBTS(msg->type) || m_trackWakeupInLBTS);
+    if (trackInLBTS && arr != std::numeric_limits<Timestamp>::max()) {
         Timestamp prev = m_minInboundArrival.load(std::memory_order_relaxed);
         while (arr < prev && !m_minInboundArrival.compare_exchange_weak(
                    prev, arr, std::memory_order_relaxed)) {}
@@ -919,10 +973,6 @@ void DistributedSimulation::startLBTSThread() {
     m_lbtsThreadRunning = true;
     m_lbtsThread = std::thread([this]() {
         DesmarMpiApiProfiler::RegisterThreadLabel("kernel.lbtsThread");
-        // For Iallreduce baseline (non-proxy / legacy), keep a thread-local request state.
-        MPI_Request req = MPI_REQUEST_NULL;
-        uint64_t sendVal = 0;
-        uint64_t recvVal = 0;
         auto nowNs = [](){
             return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -960,6 +1010,30 @@ void DistributedSimulation::startLBTSThread() {
             }
         }
         while (m_lbtsThreadRunning.load()) {
+            if (m_mpiManager &&
+                m_mpiManager->isLBTSSyncIallreduce() &&
+                m_mpiManager->isIallreduceShutdownRequested()) {
+                MPI_Comm comm = m_mpiManager->getSimulationCommunicator();
+                if (comm == MPI_COMM_NULL) comm = MPI_COMM_WORLD;
+                uint64_t gg = UINT64_MAX;
+                bool shutdownMatched = false;
+                if (m_mpiManager->isProxyThreadModeEnabled()) {
+                    m_mpiManager->proxyIallreduceSubmit(0, comm);
+                    if (m_mpiManager->proxyIallreduceTryConsume(gg, shutdownMatched) &&
+                        shutdownMatched) {
+                        break;
+                    }
+                } else {
+                    if (m_mpiManager->advanceIallreduce(0, comm, gg, shutdownMatched) &&
+                        shutdownMatched) {
+                        break;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(m_lbtsPollIntervalMicrosKernel));
+                continue;
+            }
+            MPICommunicationManager::AgentLbtsWindowSnapshot agentLbtsSnapshot;
+            bool haveAgentLbtsSnapshot = false;
             if (m_debugLBTS) { m_lbtsPerf.iters.fetch_add(1, std::memory_order_relaxed); }
             if (!m_lbtsQuiesce.load(std::memory_order_relaxed)) {
                 if (m_debugLBTS) { t0 = nowNs(); }
@@ -979,12 +1053,20 @@ void DistributedSimulation::startLBTSThread() {
                     agentsMin = m_mpiManager->getMinAgentLBTSFromTwoSidedCache();
                 } else if (m_mpiManager && m_mpiManager->isLBTSSyncIallreduce()) {
                     agentsMin = 0; // unused in Iallreduce mode
-                } else {
-                    agentsMin = m_mpiManager->getMinAgentLBTSFromLocalWindow();
+                } else if (m_mpiManager) {
+                    const bool needSyncDoorbellCache =
+                        (m_enableSyncDoorbell && m_mpiManager->isSyncDoorbellEnabled() && m_mpiManager->isUnifiedModel());
+                    agentLbtsSnapshot = m_mpiManager->snapshotAgentLbtsWindow(needSyncDoorbellCache);
+                    haveAgentLbtsSnapshot = true;
+                    agentsMin = agentLbtsSnapshot.minAgentLBTS;
                 }
                 uint64_t kernelsMin = UINT64_MAX;
+                MPICommunicationManager::KernelClockWindowSnapshot kernelClockSnapshot;
+                bool haveKernelClockSnapshot = false;
                 if (interKernelAllowed) {
-                    uint64_t minsnap = m_mpiManager->getMinKernelClockFromLocalWindow(m_kernelRanks);
+                    kernelClockSnapshot = m_mpiManager->snapshotKernelClockWindow(m_kernelRanks);
+                    haveKernelClockSnapshot = true;
+                    uint64_t minsnap = kernelClockSnapshot.minKernelClock;
                     kernelsMin = (minsnap == 0) ? UINT64_MAX : minsnap;
                 }
                 Timestamp lvtNow = this->currentTimestamp();
@@ -1037,27 +1119,27 @@ void DistributedSimulation::startLBTSThread() {
                         // PROXY: submit/poll via MPICommunicationManager (single MPI thread owns the Iallreduce request).
                         m_mpiManager->proxyIallreduceSubmit(static_cast<uint64_t>(localCandTs), comm);
                         uint64_t gg = 0;
-                        if (m_mpiManager->proxyIallreduceTryConsume(gg)) {
+                        bool shutdownMatched = false;
+                        if (m_mpiManager->proxyIallreduceTryConsume(gg, shutdownMatched)) {
+                            if (shutdownMatched) {
+                                break;
+                            }
                             g = static_cast<Timestamp>(gg);
                         } else {
                             g = lvtCur; // conservative until result is ready
                         }
                     } else {
-                        // MULTIPLE (legacy): original per-thread Iallreduce state machine.
-                    sendVal = static_cast<uint64_t>(localCandTs);
-                    if (req == MPI_REQUEST_NULL) {
-                        MPI_Iallreduce(&sendVal, &recvVal, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm, &req);
-                        g = lvtCur; // conservative until result is ready
-                    } else {
-                        int done = 0;
-                        MPI_Test(&req, &done, MPI_STATUS_IGNORE);
-                        if (done) {
-                            req = MPI_REQUEST_NULL;
-                            uint64_t gg = recvVal;
+                        // MULTIPLE: reuse the manager-owned Iallreduce session so epoch-end teardown
+                        // can safely drain any in-flight collective before the communicator is freed.
+                        uint64_t gg = 0;
+                        bool shutdownMatched = false;
+                        if (m_mpiManager->advanceIallreduce(static_cast<uint64_t>(localCandTs), comm, gg, shutdownMatched)) {
+                            if (shutdownMatched) {
+                                break;
+                            }
                             g = static_cast<Timestamp>(gg);
                         } else {
                             g = lvtCur;
-                            }
                         }
                     }
                 } else {
@@ -1124,7 +1206,11 @@ void DistributedSimulation::startLBTSThread() {
                             // Snapshot per-kernel clocks for peers we care about.
                             std::unordered_map<int,uint64_t> peerClocks;
                             if (m_enableInterKernelSync && m_mpiManager) {
-                                peerClocks = m_mpiManager->getKernelClocksForRanks(m_kernelRanks);
+                                if (haveKernelClockSnapshot) {
+                                    peerClocks = kernelClockSnapshot.perKernelClock;
+                                } else {
+                                    peerClocks = m_mpiManager->getKernelClocksForRanks(m_kernelRanks);
+                                }
                             }
 
                             m_lbtsCsv << ts << "," << rank << "," << nextIndex << ","
@@ -1154,23 +1240,25 @@ void DistributedSimulation::startLBTSThread() {
                     if (gap > pgmax) m_lbtsPerf.gapMax.store(gap, std::memory_order_relaxed);
                 }
             }
-            if (m_enableAdaptiveLBTS && m_mpiManager && m_mpiManager->isUnifiedModel()) {
-                bool changed = m_mpiManager->doorbellAnyChangedAndUpdateCache();
-                if (!changed && m_mpiManager->isDoorbellTwoSided()) {
-                    changed = m_mpiManager->consumeDoorbellFlag();
+            if (m_enableSyncDoorbell && m_mpiManager && m_mpiManager->isUnifiedModel()) {
+                bool changed = haveAgentLbtsSnapshot
+                    ? agentLbtsSnapshot.changed
+                    : m_mpiManager->syncDoorbellAnyChangedAndUpdateCache();
+                if (!changed && m_mpiManager->isSyncDoorbellEnabled()) {
+                    changed = m_mpiManager->consumeSyncDoorbellFlag();
                 }
                 if (!changed) {
                     uint64_t ss = 0, se = 0;
                     if (m_debugLBTS) { ss = nowNs(); }
-                    std::this_thread::sleep_for(std::chrono::microseconds(m_doorbellShortSleepMicros));
+                    std::this_thread::sleep_for(std::chrono::microseconds(m_syncDoorbellShortSleepMicros));
                     if (m_debugLBTS) { se = nowNs(); m_lbtsPerf.sleepNs.fetch_add(se - ss, std::memory_order_relaxed); }
                 }
-            } else if (m_enableAdaptiveLBTS && m_mpiManager && m_mpiManager->isDoorbellTwoSided()) {
-                bool changed = m_mpiManager->consumeDoorbellFlag();
+            } else if (m_enableSyncDoorbell && m_mpiManager && m_mpiManager->isSyncDoorbellEnabled()) {
+                bool changed = m_mpiManager->consumeSyncDoorbellFlag();
                 if (!changed) {
                     uint64_t ss = 0, se = 0;
                     if (m_debugLBTS) { ss = nowNs(); }
-                    std::this_thread::sleep_for(std::chrono::microseconds(m_doorbellShortSleepMicros));
+                    std::this_thread::sleep_for(std::chrono::microseconds(m_syncDoorbellShortSleepMicros));
                     if (m_debugLBTS) { se = nowNs(); m_lbtsPerf.sleepNs.fetch_add(se - ss, std::memory_order_relaxed); }
                 }
             } else {
@@ -1185,6 +1273,16 @@ void DistributedSimulation::startLBTSThread() {
 
 void DistributedSimulation::stopLBTSThread() {
     if (!m_lbtsThreadRunning.load()) return;
+    if (m_mpiManager && m_mpiManager->isLBTSSyncIallreduce()) {
+        m_lbtsQuiesce.store(true, std::memory_order_release);
+        m_mpiManager->requestIallreduceShutdown();
+        if (m_lbtsThread.joinable()) {
+            m_lbtsThread.join();
+        }
+        m_mpiManager->clearIallreduceShutdownRequest();
+        m_lbtsThreadRunning = false;
+        return;
+    }
     m_lbtsThreadRunning = false;
     if (m_lbtsThread.joinable()) {
         m_lbtsThread.join();

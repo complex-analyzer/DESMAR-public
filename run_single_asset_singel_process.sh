@@ -19,7 +19,7 @@ echo "Python library location: $CONDA_PREFIX/lib/libpython3.8.so.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # set project root path and log root directory (for C++ Agent to locate project root)
-PROJECT_ROOT="/home/sun/Projects/DESMAR"
+PROJECT_ROOT="/home/sun/Projects/DESMAR_public_ready"
 export DESMAR_LOG_ROOT="$PROJECT_ROOT/distributed_logs"
 echo "DESMAR_LOG_ROOT: $DESMAR_LOG_ROOT"
 mkdir -p "$DESMAR_LOG_ROOT"

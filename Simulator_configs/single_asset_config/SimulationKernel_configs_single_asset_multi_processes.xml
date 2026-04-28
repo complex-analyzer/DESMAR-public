@@ -160,7 +160,7 @@
             name="ORDER_LOG_AGENT"
             flushImmediately="false"
             logToConsole="true"
-            outputFile="/home/sun/Projects/DESMAR/data/agent_outputs/OrderActionLogAgent/"
+            outputFile="/home/sun/Projects/DESMAR_public_ready/data/agent_outputs/OrderActionLogAgent/"
             />
 
         <!-- simple single impact agent example - need to explicitly specify name to avoid duplication -->

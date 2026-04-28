@@ -21,6 +21,21 @@ static thread_local bool g_desmar_in_mpi_progress_thread = false;
 namespace {
 static constexpr size_t kRmaSliceAlignBytes = 8;
 
+static inline bool should_force_two_sided_control_message(const DistributedMessage* msg) {
+    // Keep readiness/shutdown control on a dedicated two-sided path even when
+    // the bulk/main transport remains RMA. This avoids teardown races against
+    // RMA mailbox/window shutdown and keeps stop control traffic out of the
+    // RMA ring.
+    if (!msg) return false;
+    const std::string& t = msg->type;
+    return t == "AGENT_RANK_READY" ||
+           t == "EVENT_SIMULATION_STOP" ||
+           t == "EVENT_SHUTDOWN_STOP" ||
+           t == "ACK_STOP" ||
+           t == "ACK_STOPPED" ||
+           t == "ACK_STOP_RECEIVED";
+}
+
 static inline size_t align_down_sz(size_t x, size_t a) {
     return (a == 0) ? x : (x - (x % a));
 }
@@ -30,6 +45,19 @@ static inline size_t compute_aligned_region_bytes(size_t windowBytes, size_t sli
     const size_t quantum = kRmaSliceAlignBytes * sliceCount;
     const size_t alignedTotal = align_down_sz(windowBytes, quantum);
     return alignedTotal / sliceCount;
+}
+
+static bool isBroadcastLikeMessage(const DistributedMessage* msg) {
+    if (!msg) return false;
+
+    if (msg->routingType == RoutingType::BROADCAST ||
+        msg->routingType == RoutingType::PREFIX_MATCH) {
+        return true;
+    }
+
+    return std::any_of(msg->targets.begin(), msg->targets.end(), [](const std::string& target) {
+        return target == "*" || (!target.empty() && target.back() == '*');
+    });
 }
 } // namespace
 
@@ -57,6 +85,251 @@ void MPICommunicationManager::collectCompletedIsends() {
             ++i;
         }
     }
+}
+
+void MPICommunicationManager::refreshDoorbellMode() {
+    if (m_mainDoorbellEnabled || m_syncDoorbellEnabled) {
+        m_doorbellMode = DoorbellMode::TWO_SIDED;
+        return;
+    }
+    m_doorbellMode = DoorbellMode::DISABLED;
+    m_mainDoorbellPending.store(false, std::memory_order_relaxed);
+    m_syncDoorbellPending.store(false, std::memory_order_relaxed);
+}
+
+void MPICommunicationManager::sendDoorbellNotify(int targetGlobalRank, int tag, const char* channelLabel) {
+    if (m_doorbellMode != DoorbellMode::TWO_SIDED) return;
+    if (targetGlobalRank < 0 || targetGlobalRank == m_rank) return;
+
+    MPI_Comm comm = doorbellCommunicator();
+    const int targetCommRank = (comm == MPI_COMM_WORLD) ? targetGlobalRank : toSimCommRank(targetGlobalRank);
+    if (targetCommRank < 0) return;
+
+    auto buf = std::make_shared<std::vector<char>>(sizeof(int));
+    int one = 1;
+    std::memcpy(buf->data(), &one, sizeof(int));
+    MPI_Request req = MPI_REQUEST_NULL;
+    MPI_Isend(buf->data(), 1, MPI_INT, targetCommRank, tag, comm, &req);
+    {
+        std::lock_guard<std::mutex> lk(m_isendMutex);
+        m_isendPending.push_back(PendingIsend{req, buf, 0});
+    }
+
+    static std::mutex s_mu;
+    static std::unordered_set<uint64_t> s_logged;
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(tag)) << 32)
+                       | static_cast<uint32_t>(m_rank);
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lk(s_mu);
+        first = s_logged.insert(key).second;
+    }
+    if (first) {
+        std::cout << "[DOORBELL][" << channelLabel << "_SEND] rank=" << m_rank
+                  << " target=" << targetGlobalRank
+                  << " tag=" << tag
+                  << std::endl;
+    }
+}
+
+void MPICommunicationManager::drainDoorbellMessages(int tag,
+                                                    std::atomic<bool>& pendingFlag,
+                                                    const char* channelLabel) {
+    if (m_doorbellMode != DoorbellMode::TWO_SIDED) return;
+
+    MPI_Comm comm = doorbellCommunicator();
+    int flag = 0;
+    MPI_Status st;
+    do {
+        flag = 0;
+        MPI_Iprobe(MPI_ANY_SOURCE, tag, comm, &flag, &st);
+        if (flag) {
+            int dummy = 0;
+            MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, tag, comm, &st);
+            pendingFlag.store(true, std::memory_order_release);
+            const int sourceGlobalRank = (comm == MPI_COMM_WORLD) ? st.MPI_SOURCE : simCommRankToGlobal(st.MPI_SOURCE);
+
+            static std::mutex s_mu;
+            static std::unordered_set<uint64_t> s_logged;
+            const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(tag)) << 32)
+                               | static_cast<uint32_t>(m_rank);
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lk(s_mu);
+                first = s_logged.insert(key).second;
+            }
+            if (first) {
+                std::cout << "[DOORBELL][" << channelLabel << "_RECV] rank=" << m_rank
+                          << " source=" << ((sourceGlobalRank >= 0) ? sourceGlobalRank : st.MPI_SOURCE)
+                          << " tag=" << tag
+                          << std::endl;
+            }
+        }
+    } while (flag);
+}
+
+std::chrono::microseconds MPICommunicationManager::computeReceiveIdleWait(bool hadMainMessages) {
+    if (m_mainCommMode == MainCommMode::RMA_RING && isMainDoorbellEnabled()) {
+        if (hadMainMessages) {
+            return std::chrono::microseconds(0);
+        }
+        if (consumeMainDoorbellFlag()) {
+            return std::chrono::microseconds(0);
+        }
+        return std::chrono::microseconds(m_mainDoorbellShortSleepMicros);
+    }
+    return std::chrono::microseconds(m_rmaPollSleepMicros);
+}
+
+bool MPICommunicationManager::computeRemoteKernelWindowLayoutForAgent(int kernelRank,
+                                                                      int senderRank,
+                                                                      RemoteWindowLayout& layout) const {
+    layout = RemoteWindowLayout{};
+    layout.source = "kernel_window";
+
+    if (m_remoteLayoutCacheReady) {
+        auto cacheIt = m_kernelRemoteLayoutCacheByKernel.find(kernelRank);
+        if (cacheIt != m_kernelRemoteLayoutCacheByKernel.end()) {
+            const auto& entry = cacheIt->second;
+            if (!entry.valid) return false;
+            auto posIt = entry.senderToSliceIndex.find(senderRank);
+            if (posIt == entry.senderToSliceIndex.end()) return false;
+            layout.sliceCount = entry.sliceCount;
+            layout.sliceIndex = posIt->second;
+            layout.windowBytes = entry.windowBytes;
+            layout.perRegionBytes = entry.perRegionBytes;
+            layout.headerDisp = static_cast<MPI_Aint>(layout.sliceIndex * layout.perRegionBytes);
+            const uint64_t gen = m_remoteLayoutCacheGeneration.load(std::memory_order_relaxed);
+            uint64_t expected = m_kernelRemoteLayoutCacheHitLoggedGeneration.load(std::memory_order_relaxed);
+            if (gen != 0 && expected != gen &&
+                m_kernelRemoteLayoutCacheHitLoggedGeneration.compare_exchange_strong(expected, gen, std::memory_order_relaxed)) {
+                std::cout << "[RMA][LAYOUT_CACHE_HIT][KERNEL_WIN] rank=" << m_rank
+                          << " gen=" << gen
+                          << " kernel=" << kernelRank
+                          << " sender=" << senderRank
+                          << " sliceIndex=" << layout.sliceIndex
+                          << " sliceCount=" << layout.sliceCount
+                          << " windowBytes=" << layout.windowBytes
+                          << " perRegionBytes=" << layout.perRegionBytes
+                          << std::endl;
+            }
+            return true;
+        }
+    }
+
+    std::vector<int> targetAgentRanks;
+    auto itAR = m_agentRanksByKernel.find(kernelRank);
+    if (itAR != m_agentRanksByKernel.end()) {
+        targetAgentRanks = itAR->second;
+    } else if (kernelRank == m_simulationRank) {
+        targetAgentRanks = m_agentRanks;
+    }
+    auto itCross = m_crossAgentRanksByKernel.find(kernelRank);
+    if (itCross != m_crossAgentRanksByKernel.end()) {
+        for (int cr : itCross->second) {
+            targetAgentRanks.push_back(cr);
+        }
+        std::sort(targetAgentRanks.begin(), targetAgentRanks.end());
+        targetAgentRanks.erase(std::unique(targetAgentRanks.begin(), targetAgentRanks.end()), targetAgentRanks.end());
+    }
+    if (targetAgentRanks.empty()) return false;
+
+    auto itPos = std::find(targetAgentRanks.begin(), targetAgentRanks.end(), senderRank);
+    if (itPos == targetAgentRanks.end()) return false;
+
+    auto itW = m_remoteKernelWindowSizeByKernel.find(kernelRank);
+    const size_t remoteWindowBytes = (itW != m_remoteKernelWindowSizeByKernel.end())
+        ? itW->second
+        : m_remoteKernelWindowSizeBytes;
+    if (remoteWindowBytes == 0) return false;
+
+    const size_t remoteSliceCount = targetAgentRanks.size();
+    const size_t remotePerRegionBytes = compute_aligned_region_bytes(remoteWindowBytes, remoteSliceCount);
+    if (remotePerRegionBytes == 0 || remotePerRegionBytes < sizeof(PackedQueueHeader)) return false;
+
+    layout.sliceCount = remoteSliceCount;
+    layout.sliceIndex = static_cast<size_t>(std::distance(targetAgentRanks.begin(), itPos));
+    layout.windowBytes = remoteWindowBytes;
+    layout.perRegionBytes = remotePerRegionBytes;
+    layout.headerDisp = static_cast<MPI_Aint>(layout.sliceIndex * remotePerRegionBytes);
+    return true;
+}
+
+bool MPICommunicationManager::computeRemoteAgentWindowLayoutForKernel(int targetRank,
+                                                                      int senderRank,
+                                                                      RemoteWindowLayout& layout) const {
+    layout = RemoteWindowLayout{};
+
+    if (m_remoteLayoutCacheReady) {
+        auto cacheIt = m_agentRemoteLayoutCacheByTarget.find(targetRank);
+        if (cacheIt != m_agentRemoteLayoutCacheByTarget.end()) {
+            const auto& entry = cacheIt->second;
+            layout.isCrossTarget = entry.isCrossTarget;
+            layout.source = entry.source.c_str();
+            if (!entry.valid) return false;
+            auto posIt = entry.senderToSliceIndex.find(senderRank);
+            if (posIt == entry.senderToSliceIndex.end()) return false;
+            layout.sliceCount = entry.sliceCount;
+            layout.sliceIndex = posIt->second;
+            layout.windowBytes = entry.windowBytes;
+            layout.perRegionBytes = entry.perRegionBytes;
+            layout.headerDisp = static_cast<MPI_Aint>(layout.sliceIndex * layout.perRegionBytes);
+            const uint64_t gen = m_remoteLayoutCacheGeneration.load(std::memory_order_relaxed);
+            uint64_t expected = m_agentRemoteLayoutCacheHitLoggedGeneration.load(std::memory_order_relaxed);
+            if (gen != 0 && expected != gen &&
+                m_agentRemoteLayoutCacheHitLoggedGeneration.compare_exchange_strong(expected, gen, std::memory_order_relaxed)) {
+                std::cout << "[RMA][LAYOUT_CACHE_HIT][AGENT_WIN] rank=" << m_rank
+                          << " gen=" << gen
+                          << " target=" << targetRank
+                          << " sender=" << senderRank
+                          << " source=" << entry.source
+                          << " isCrossTarget=" << (entry.isCrossTarget ? 1 : 0)
+                          << " sliceIndex=" << layout.sliceIndex
+                          << " sliceCount=" << layout.sliceCount
+                          << " windowBytes=" << layout.windowBytes
+                          << " perRegionBytes=" << layout.perRegionBytes
+                          << std::endl;
+            }
+            return true;
+        }
+    }
+
+    std::vector<int> senders;
+    const bool isCrossTarget = (m_crossAgentRanks.find(targetRank) != m_crossAgentRanks.end());
+    layout.isCrossTarget = isCrossTarget;
+    if (isCrossTarget) {
+        auto topoIt = m_crossAgentWindowTopology.find(targetRank);
+        if (topoIt != m_crossAgentWindowTopology.end() && !topoIt->second.empty()) {
+            senders = topoIt->second;
+            std::sort(senders.begin(), senders.end());
+            senders.erase(std::unique(senders.begin(), senders.end()), senders.end());
+            layout.source = "cross_topology";
+        } else {
+            layout.source = "missing_cross_topology";
+            return false;
+        }
+    } else {
+        senders = { m_simulationRank };
+        layout.source = "direct_kernel";
+    }
+    if (senders.empty()) return false;
+
+    auto it = std::lower_bound(senders.begin(), senders.end(), senderRank);
+    if (it == senders.end() || *it != senderRank) return false;
+
+    const size_t remoteWindowBytes = m_remoteAgentWindowSizeBytes;
+    const size_t remoteSliceCount = senders.size();
+    const size_t remotePerRegionBytes = compute_aligned_region_bytes(remoteWindowBytes, remoteSliceCount);
+    if (remoteWindowBytes == 0 || remotePerRegionBytes == 0 || remotePerRegionBytes < sizeof(PackedQueueHeader)) {
+        return false;
+    }
+
+    layout.sliceCount = remoteSliceCount;
+    layout.sliceIndex = static_cast<size_t>(std::distance(senders.begin(), it));
+    layout.windowBytes = remoteWindowBytes;
+    layout.perRegionBytes = remotePerRegionBytes;
+    layout.headerDisp = static_cast<MPI_Aint>(layout.sliceIndex * remotePerRegionBytes);
+    return true;
 }
 
 bool MPICommunicationManager::initialize(bool startWorkers) {
@@ -172,59 +445,54 @@ bool MPICommunicationManager::initialize(bool startWorkers) {
     // To avoid cross-epoch contamination, proactively drain any stale two-sided messages on the tags we use
     // BEFORE starting worker threads.
     if (m_size > 1) {
-        const bool needsDrain =
-            (m_mainCommMode == MainCommMode::TWO_SIDED) || (m_lbtsSyncMode == LBTSSyncMode::TWO_SIDED);
-        if (needsDrain) {
-            int drained = 0;
-            MPI_Status st;
-            int flag = 0;
+        int drained = 0;
+        MPI_Status st;
+        int flag = 0;
 
-            auto drain_bytes_tag = [&](int tag) {
-                while (true) {
-                    flag = 0;
-                    MPI_Iprobe(MPI_ANY_SOURCE, tag, MPI_COMM_WORLD, &flag, &st);
-                    if (!flag) break;
-                    int nbytes = 0;
-                    MPI_Get_count(&st, MPI_BYTE, &nbytes);
-                    if (nbytes <= 0) {
-                        // still need to receive to clear it
-                        char dummy;
-                        MPI_Recv(&dummy, 0, MPI_BYTE, st.MPI_SOURCE, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    } else {
-                        std::vector<char> buf(static_cast<size_t>(nbytes));
-                        MPI_Recv(buf.data(), nbytes, MPI_BYTE, st.MPI_SOURCE, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    }
-                    drained += 1;
+        auto drain_bytes_tag = [&](int tag) {
+            while (true) {
+                flag = 0;
+                MPI_Iprobe(MPI_ANY_SOURCE, tag, MPI_COMM_WORLD, &flag, &st);
+                if (!flag) break;
+                int nbytes = 0;
+                MPI_Get_count(&st, MPI_BYTE, &nbytes);
+                if (nbytes <= 0) {
+                    // still need to receive to clear it
+                    char dummy;
+                    MPI_Recv(&dummy, 0, MPI_BYTE, st.MPI_SOURCE, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                } else {
+                    std::vector<char> buf(static_cast<size_t>(nbytes));
+                    MPI_Recv(buf.data(), nbytes, MPI_BYTE, st.MPI_SOURCE, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 }
-            };
-            auto drain_u64_tag = [&](int tag) {
-                while (true) {
-                    flag = 0;
-                    MPI_Iprobe(MPI_ANY_SOURCE, tag, MPI_COMM_WORLD, &flag, &st);
-                    if (!flag) break;
-                    uint64_t v = 0;
-                    MPI_Recv(&v, 1, MPI_UNSIGNED_LONG_LONG, st.MPI_SOURCE, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    drained += 1;
-                }
-            };
+                drained += 1;
+            }
+        };
+        auto drain_u64_tag = [&](int tag) {
+            while (true) {
+                flag = 0;
+                MPI_Iprobe(MPI_ANY_SOURCE, tag, MPI_COMM_WORLD, &flag, &st);
+                if (!flag) break;
+                uint64_t v = 0;
+                MPI_Recv(&v, 1, MPI_UNSIGNED_LONG_LONG, st.MPI_SOURCE, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                drained += 1;
+            }
+        };
 
-            // Main transport tags (two-sided main channel)
-            if (m_mainCommMode == MainCommMode::TWO_SIDED) {
-                drain_bytes_tag(MAIN_CTRL_TAG);
-                drain_bytes_tag(MAIN_MSG_TAG);
-            }
-            // LBTS sync tags (two-sided sync)
-            if (m_lbtsSyncMode == LBTSSyncMode::TWO_SIDED) {
-                drain_u64_tag(LBTS_HB_TAG);
-                drain_u64_tag(LBTS_G_TAG);
-            }
+        // MAIN_CTRL_TAG may carry READY even when the bulk/main transport is RMA.
+        drain_bytes_tag(MAIN_CTRL_TAG);
+        if (m_mainCommMode == MainCommMode::TWO_SIDED) {
+            drain_bytes_tag(MAIN_MSG_TAG);
+        }
+        if (m_lbtsSyncMode == LBTSSyncMode::TWO_SIDED) {
+            drain_u64_tag(LBTS_HB_TAG);
+            drain_u64_tag(LBTS_G_TAG);
+        }
 
-            if (drained > 0) {
-                std::cout << "[MPI][Drain] rank=" << m_rank
-                          << " drained " << drained
-                          << " stale two-sided messages before starting workers"
-                          << std::endl;
-            }
+        if (drained > 0) {
+            std::cout << "[MPI][Drain] rank=" << m_rank
+                      << " drained " << drained
+                      << " stale two-sided messages before starting workers"
+                      << std::endl;
         }
     }
     
@@ -245,8 +513,27 @@ bool MPICommunicationManager::initialize(bool startWorkers) {
 }
 
 void MPICommunicationManager::setSimulationCommunicator(MPI_Comm comm) {
+    const MPI_Comm prevComm = m_commSimulation;
+    const bool commChanged = (prevComm != comm);
+    if (commChanged) {
+        {
+            std::lock_guard<std::mutex> lk(m_iallreduceMutex);
+            if (m_iallreduceSession.inFlight && m_running.load(std::memory_order_relaxed)) {
+                std::cerr << "[IALLREDUCE][FATAL] rank=" << m_rank
+                          << " setSimulationCommunicator() called while an Iallreduce is still in flight"
+                          << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 96);
+            }
+        }
+        finishIallreduceEpochSession();
+        m_iallreduceCommGeneration.fetch_add(1, std::memory_order_relaxed);
+        m_proxyAllreduceComm.store((comm == MPI_COMM_NULL) ? MPI_COMM_WORLD : comm,
+                                   std::memory_order_relaxed);
+    }
+
     m_commSimulation = comm;
     m_gcommRankOfGlobal.clear();
+    m_simCommRankToGlobal.clear();
 
     if (m_commSimulation == MPI_COMM_NULL || m_commSimulation == MPI_COMM_WORLD) {
         // Ensure groups are not used in identity mode.
@@ -264,19 +551,233 @@ void MPICommunicationManager::setSimulationCommunicator(MPI_Comm comm) {
         m_simGroup = MPI_GROUP_NULL;
     }
     MPI_Comm_group(m_commSimulation, &m_simGroup);
+
+    int worldSize = 0;
+    int simSize = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
+    MPI_Comm_size(m_commSimulation, &simSize);
+    std::vector<int> inRanks((size_t)worldSize);
+    for (int i = 0; i < worldSize; ++i) inRanks[(size_t)i] = i;
+    std::vector<int> outRanks((size_t)worldSize, MPI_UNDEFINED);
+    MPI_Group_translate_ranks(m_worldGroup, worldSize, inRanks.data(), m_simGroup, outRanks.data());
+    m_simCommRankToGlobal.assign((size_t)simSize, -1);
+    for (int i = 0; i < worldSize; ++i) {
+        if (outRanks[(size_t)i] == MPI_UNDEFINED) continue;
+        m_gcommRankOfGlobal[i] = outRanks[(size_t)i];
+        if (outRanks[(size_t)i] >= 0 && outRanks[(size_t)i] < simSize) {
+            m_simCommRankToGlobal[(size_t)outRanks[(size_t)i]] = i;
+        }
+    }
 }
 
 void MPICommunicationManager::enableRMALockAll() {
+    m_lockAllRequested = true;
     if (m_window != MPI_WIN_NULL && !m_lockedAll) {
         MPI_Win_lock_all(MPI_MODE_NOCHECK, m_window);
         m_lockedAll = true;
         std::cout << "MPI RMA lock_all enabled on rank " << m_rank << std::endl;
+    }
+    if (m_kernelClockWin != MPI_WIN_NULL && !m_kernelClockLockedAll) {
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, m_kernelClockWin);
+        m_kernelClockLockedAll = true;
+        std::cout << "MPI kernel clock lock_all enabled on rank " << m_rank << std::endl;
+    }
+}
+
+int MPICommunicationManager::beginMainWindowLocalAccess(bool mayWrite) {
+    (void)mayWrite;
+    if (!m_useRMA || m_window == MPI_WIN_NULL || m_isUnifiedModel) return -1;
+    if (m_lockedAll) {
+        MPI_Win_sync(m_window);
+        return -1;
+    }
+    const int selfRank = toWinCommRank(m_rank);
+    if (selfRank < 0) return -1;
+    MPI_Win_lock(MPI_LOCK_SHARED, selfRank, 0, m_window);
+    return selfRank;
+}
+
+void MPICommunicationManager::endMainWindowLocalAccess(int selfRank, bool mayWrite) {
+    if (!m_useRMA || m_window == MPI_WIN_NULL || m_isUnifiedModel) return;
+    if (m_lockedAll) {
+        if (mayWrite) {
+            MPI_Win_sync(m_window);
+        }
+        return;
+    }
+    if (selfRank >= 0) {
+        MPI_Win_unlock(selfRank, m_window);
+    }
+}
+
+int MPICommunicationManager::beginKernelClockLocalAccess(bool mayWrite) {
+    (void)mayWrite;
+    if (m_kernelClockWin == MPI_WIN_NULL || m_kernelClockUnifiedModel) return -1;
+    if (m_kernelClockLockedAll) {
+        MPI_Win_sync(m_kernelClockWin);
+        return -1;
+    }
+    const int selfRank = (m_commKernels != MPI_COMM_NULL) ? m_kcommRank : m_rank;
+    if (selfRank < 0) return -1;
+    MPI_Win_lock(MPI_LOCK_SHARED, selfRank, 0, m_kernelClockWin);
+    return selfRank;
+}
+
+void MPICommunicationManager::endKernelClockLocalAccess(int selfRank, bool mayWrite) {
+    if (m_kernelClockWin == MPI_WIN_NULL || m_kernelClockUnifiedModel) return;
+    if (m_kernelClockLockedAll) {
+        if (mayWrite) {
+            MPI_Win_sync(m_kernelClockWin);
+        }
+        return;
+    }
+    if (selfRank >= 0) {
+        MPI_Win_unlock(selfRank, m_kernelClockWin);
     }
 }
 
 
 void MPICommunicationManager::setLocalAgentLBTSValue(uint64_t v) {
     m_lbtsValue.store(v, std::memory_order_relaxed);
+}
+
+void MPICommunicationManager::invalidateRemoteLayoutCaches(const char* reason) {
+    m_remoteLayoutCacheReady = false;
+    m_kernelRemoteLayoutCacheByKernel.clear();
+    m_agentRemoteLayoutCacheByTarget.clear();
+    m_remoteLayoutCacheLastReason = (reason && *reason) ? reason : "unspecified";
+}
+
+void MPICommunicationManager::rebuildRemoteLayoutCaches(const char* reason) {
+    m_kernelRemoteLayoutCacheByKernel.clear();
+    m_agentRemoteLayoutCacheByTarget.clear();
+    if (reason && *reason) {
+        m_remoteLayoutCacheLastReason = reason;
+    }
+
+    std::unordered_set<int> kernelKeys = m_kernelTargets;
+    kernelKeys.insert(m_simulationRank);
+    for (const auto& kv : m_agentRanksByKernel) kernelKeys.insert(kv.first);
+    for (const auto& kv : m_crossAgentRanksByKernel) kernelKeys.insert(kv.first);
+
+    for (int kernelRank : kernelKeys) {
+        std::vector<int> targetAgentRanks;
+        auto itAR = m_agentRanksByKernel.find(kernelRank);
+        if (itAR != m_agentRanksByKernel.end()) {
+            targetAgentRanks = itAR->second;
+        } else if (kernelRank == m_simulationRank) {
+            targetAgentRanks = m_agentRanks;
+        }
+        auto itCross = m_crossAgentRanksByKernel.find(kernelRank);
+        if (itCross != m_crossAgentRanksByKernel.end()) {
+            targetAgentRanks.insert(targetAgentRanks.end(), itCross->second.begin(), itCross->second.end());
+        }
+        std::sort(targetAgentRanks.begin(), targetAgentRanks.end());
+        targetAgentRanks.erase(std::unique(targetAgentRanks.begin(), targetAgentRanks.end()), targetAgentRanks.end());
+        if (targetAgentRanks.empty()) continue;
+
+        KernelRemoteLayoutCacheEntry entry;
+        auto itW = m_remoteKernelWindowSizeByKernel.find(kernelRank);
+        entry.windowBytes = (itW != m_remoteKernelWindowSizeByKernel.end())
+            ? itW->second
+            : m_remoteKernelWindowSizeBytes;
+        if (entry.windowBytes == 0) {
+            m_kernelRemoteLayoutCacheByKernel[kernelRank] = std::move(entry);
+            continue;
+        }
+        entry.sliceCount = targetAgentRanks.size();
+        entry.perRegionBytes = compute_aligned_region_bytes(entry.windowBytes, entry.sliceCount);
+        if (entry.perRegionBytes == 0 || entry.perRegionBytes < sizeof(PackedQueueHeader)) {
+            m_kernelRemoteLayoutCacheByKernel[kernelRank] = std::move(entry);
+            continue;
+        }
+        for (size_t i = 0; i < targetAgentRanks.size(); ++i) {
+            entry.senderToSliceIndex[targetAgentRanks[i]] = i;
+        }
+        entry.valid = true;
+        m_kernelRemoteLayoutCacheByKernel[kernelRank] = std::move(entry);
+    }
+
+    std::unordered_set<int> agentTargets(m_crossAgentRanks.begin(), m_crossAgentRanks.end());
+    for (int ar : m_agentRanks) agentTargets.insert(ar);
+    for (const auto& kv : m_crossAgentWindowTopology) agentTargets.insert(kv.first);
+
+    for (int targetRank : agentTargets) {
+        AgentRemoteLayoutCacheEntry entry;
+        entry.isCrossTarget = (m_crossAgentRanks.find(targetRank) != m_crossAgentRanks.end());
+
+        std::vector<int> senders;
+        if (entry.isCrossTarget) {
+            auto topoIt = m_crossAgentWindowTopology.find(targetRank);
+            if (topoIt != m_crossAgentWindowTopology.end() && !topoIt->second.empty()) {
+                senders = topoIt->second;
+                std::sort(senders.begin(), senders.end());
+                senders.erase(std::unique(senders.begin(), senders.end()), senders.end());
+                entry.source = "cross_topology";
+            } else {
+                entry.source = "missing_cross_topology";
+                m_agentRemoteLayoutCacheByTarget[targetRank] = std::move(entry);
+                continue;
+            }
+        } else {
+            senders = {m_simulationRank};
+            entry.source = "direct_kernel";
+        }
+
+        entry.windowBytes = m_remoteAgentWindowSizeBytes;
+        if (entry.windowBytes == 0) {
+            m_agentRemoteLayoutCacheByTarget[targetRank] = std::move(entry);
+            continue;
+        }
+        entry.sliceCount = senders.size();
+        entry.perRegionBytes = compute_aligned_region_bytes(entry.windowBytes, entry.sliceCount);
+        if (entry.sliceCount == 0 || entry.perRegionBytes == 0 || entry.perRegionBytes < sizeof(PackedQueueHeader)) {
+            m_agentRemoteLayoutCacheByTarget[targetRank] = std::move(entry);
+            continue;
+        }
+        for (size_t i = 0; i < senders.size(); ++i) {
+            entry.senderToSliceIndex[senders[i]] = i;
+        }
+        entry.valid = true;
+        m_agentRemoteLayoutCacheByTarget[targetRank] = std::move(entry);
+    }
+
+    m_remoteLayoutCacheReady = true;
+    const uint64_t gen = m_remoteLayoutCacheGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
+    m_kernelRemoteLayoutCacheHitLoggedGeneration.store(0, std::memory_order_relaxed);
+    m_agentRemoteLayoutCacheHitLoggedGeneration.store(0, std::memory_order_relaxed);
+
+    size_t kernelValidCount = 0;
+    size_t kernelInvalidCount = 0;
+    for (const auto& kv : m_kernelRemoteLayoutCacheByKernel) {
+        if (kv.second.valid) {
+            ++kernelValidCount;
+        } else {
+            ++kernelInvalidCount;
+        }
+    }
+    size_t agentValidCount = 0;
+    size_t agentInvalidCount = 0;
+    for (const auto& kv : m_agentRemoteLayoutCacheByTarget) {
+        if (kv.second.valid) {
+            ++agentValidCount;
+        } else {
+            ++agentInvalidCount;
+        }
+    }
+
+    std::cout << "[RMA][LAYOUT_CACHE_REBUILD] rank=" << m_rank
+              << " gen=" << gen
+              << " reason=" << m_remoteLayoutCacheLastReason
+              << " kernelKeys=" << kernelKeys.size()
+              << " kernelEntries=" << m_kernelRemoteLayoutCacheByKernel.size()
+              << " kernelValid=" << kernelValidCount
+              << " kernelInvalid=" << kernelInvalidCount
+              << " agentTargets=" << agentTargets.size()
+              << " agentEntries=" << m_agentRemoteLayoutCacheByTarget.size()
+              << " agentValid=" << agentValidCount
+              << " agentInvalid=" << agentInvalidCount
+              << std::endl;
 }
 
 void MPICommunicationManager::rmaWriteAgentLBTSHeartbeat() {
@@ -302,24 +803,6 @@ void MPICommunicationManager::rmaWriteAgentLBTSHeartbeat() {
     }
     // During quiesce/shutdown, do not issue any more RMA flushes.
     if (m_abortRmaPuts.load(std::memory_order_acquire) || !m_running.load(std::memory_order_relaxed)) return;
-    // Safety: even if the upper layer never "receives" STOP (e.g., ring backpressure),
-    // the STOP mailbox may already be written into this rank's local window header.
-    // If STOP is seen, stop sending heartbeats to avoid UCX fatal "Remote access" during epoch-end teardown.
-    if (!m_isUnifiedModel) {
-        MPI_Win_sync(m_window);
-    }
-    for (size_t idx = 0; idx < m_sliceCount; ++idx) {
-        auto* hdr = localQueueHeaderByIndex(idx);
-        uint64_t v1 = hdr->stop_cmd_ver;
-        if (v1 == 0) continue;
-        uint64_t cmd = hdr->stop_cmd;
-        uint64_t v2 = hdr->stop_cmd_ver;
-        if (v1 != v2) continue;
-        if (cmd == 1) {
-            return;
-        }
-    }
-
     std::vector<int> targets;
     if (!m_kernelTargets.empty()) {
         targets.assign(m_kernelTargets.begin(), m_kernelTargets.end());
@@ -327,8 +810,8 @@ void MPICommunicationManager::rmaWriteAgentLBTSHeartbeat() {
         targets.push_back(m_simulationRank);
     }
 
-    uint64_t v = m_lbtsVersionCounter.fetch_add(1, std::memory_order_relaxed) + 1;
     uint64_t ts1 = m_lbtsValue.load(std::memory_order_relaxed);
+    uint64_t v = m_lbtsVersionCounter.fetch_add(1, std::memory_order_relaxed) + 1;
 
     for (int trg : targets) {
         // Always-on diagnostic: trace LBTS heartbeat placement once per (origin,target).
@@ -339,35 +822,17 @@ void MPICommunicationManager::rmaWriteAgentLBTSHeartbeat() {
             bool first = false;
             { std::lock_guard<std::mutex> lk(s_mu); first = s_seen.insert(key).second; }
             if (first) {
-                size_t remoteWindowBytes2 = 0;
-                auto itW2 = m_remoteKernelWindowSizeByKernel.find(trg);
-                remoteWindowBytes2 = (itW2 != m_remoteKernelWindowSizeByKernel.end()) ? itW2->second : m_remoteKernelWindowSizeBytes;
-                std::vector<int> senders2;
-                auto itAR2 = m_agentRanksByKernel.find(trg);
-                if (itAR2 != m_agentRanksByKernel.end()) senders2 = itAR2->second;
-                else if (trg == m_simulationRank) senders2 = m_agentRanks;
-                auto itCross2 = m_crossAgentRanksByKernel.find(trg);
-                if (itCross2 != m_crossAgentRanksByKernel.end()) {
-                    for (int cr : itCross2->second) senders2.push_back(cr);
-                    std::sort(senders2.begin(), senders2.end());
-                    senders2.erase(std::unique(senders2.begin(), senders2.end()), senders2.end());
-                }
-                size_t remoteSliceCount2 = senders2.empty() ? 0 : senders2.size();
-                size_t sliceIndex2 = 0;
-                if (remoteSliceCount2) {
-                    auto itPos2 = std::find(senders2.begin(), senders2.end(), m_rank);
-                    if (itPos2 != senders2.end()) sliceIndex2 = (size_t)std::distance(senders2.begin(), itPos2);
-                }
-                size_t perRegion2 = (remoteSliceCount2 == 0) ? 0 : (remoteWindowBytes2 / remoteSliceCount2);
-                MPI_Aint hdrDisp2 = (MPI_Aint)(sliceIndex2 * perRegion2);
+                RemoteWindowLayout layout;
+                const bool haveLayout = computeRemoteKernelWindowLayoutForAgent(trg, m_rank, layout);
                 std::cout << "[LBTS][HB_TRACE] origin=" << m_rank
                           << " targetKernel=" << trg
                           << " targetComm=" << toWinCommRank(trg)
-                          << " remoteWindowBytes=" << remoteWindowBytes2
-                          << " remoteSliceCount=" << remoteSliceCount2
-                          << " sliceIndex=" << sliceIndex2
-                          << " perRegionBytes=" << perRegion2
-                          << " hdrDisp=" << hdrDisp2
+                          << " remoteWindowBytes=" << layout.windowBytes
+                          << " remoteSliceCount=" << layout.sliceCount
+                          << " sliceIndex=" << layout.sliceIndex
+                          << " perRegionBytes=" << layout.perRegionBytes
+                          << " hdrDisp=" << layout.headerDisp
+                          << " layoutOk=" << (haveLayout ? 1 : 0)
                           << " unified=" << (m_isUnifiedModel ? 1 : 0)
                           << " lockedAll=" << (m_lockedAll ? 1 : 0)
                           << std::endl;
@@ -378,64 +843,27 @@ void MPICommunicationManager::rmaWriteAgentLBTSHeartbeat() {
             // Target not part of the window communicator (e.g. learner ranks excluded from commCppOnly).
             continue;
         }
-        std::vector<int> targetAgentRanks;
-        auto itAR = m_agentRanksByKernel.find(trg);
-        if (itAR != m_agentRanksByKernel.end()) {
-            targetAgentRanks = itAR->second;
-        } else if (trg == m_simulationRank) {
-            targetAgentRanks = m_agentRanks;
-        }
-        auto itCross = m_crossAgentRanksByKernel.find(trg);
-        if (itCross != m_crossAgentRanksByKernel.end()) {
-            for (int cr : itCross->second) {
-                targetAgentRanks.push_back(cr);
-            }
-            std::sort(targetAgentRanks.begin(), targetAgentRanks.end());
-            targetAgentRanks.erase(std::unique(targetAgentRanks.begin(), targetAgentRanks.end()), targetAgentRanks.end());
-        }
-        if (targetAgentRanks.empty()) continue;
-        auto itPos = std::find(targetAgentRanks.begin(), targetAgentRanks.end(), m_rank);
-        if (itPos == targetAgentRanks.end()) {
+        RemoteWindowLayout layout;
+        if (!computeRemoteKernelWindowLayoutForAgent(trg, m_rank, layout)) {
             static std::unordered_set<int> warned;
             if (warned.find(trg) == warned.end()) {
                 std::cout << "[LBTS][WARN][AGENT] rank=" << m_rank << " target=" << trg
-                          << " sender_not_found; target_senders={";
-                for (size_t i=0;i<targetAgentRanks.size();++i) std::cout << targetAgentRanks[i] << (i+1<targetAgentRanks.size()? ",":"");
-                std::cout << "}" << std::endl;
+                          << " sender_layout_unavailable" << std::endl;
                 warned.insert(trg);
             }
             continue;
         }
-        size_t sliceIndex = static_cast<size_t>(std::distance(targetAgentRanks.begin(), itPos));
-        size_t remoteSliceCount = targetAgentRanks.size();
-        if (remoteSliceCount == 0) continue;
-        size_t remoteWindowBytes = 0;
-        auto itW = m_remoteKernelWindowSizeByKernel.find(trg);
-        if (itW != m_remoteKernelWindowSizeByKernel.end()) {
-            remoteWindowBytes = itW->second;
-        } else {
-            remoteWindowBytes = m_remoteKernelWindowSizeBytes;
-        }
-        if (remoteWindowBytes == 0) continue;
-        size_t remotePerRegionBytes = compute_aligned_region_bytes(remoteWindowBytes, remoteSliceCount);
-        if (remotePerRegionBytes == 0) continue;
-        MPI_Aint hdrDisp = static_cast<MPI_Aint>(sliceIndex * remotePerRegionBytes);
 
         if (!m_lockedAll) {
             MPI_Win_lock(MPI_LOCK_EXCLUSIVE, trgComm, 0, m_window);
         }
         MPI_Put(&ts1, 1, MPI_UNSIGNED_LONG_LONG,
-                trgComm, hdrDisp + offsetof(PackedQueueHeader, lbts_value), 1, MPI_UNSIGNED_LONG_LONG, m_window);
+                trgComm, layout.headerDisp + offsetof(PackedQueueHeader, lbts_value), 1, MPI_UNSIGNED_LONG_LONG, m_window);
         MPI_Put(&v, 1, MPI_UNSIGNED_LONG_LONG,
-                trgComm, hdrDisp + offsetof(PackedQueueHeader, lbts_ver), 1, MPI_UNSIGNED_LONG_LONG, m_window);
+                trgComm, layout.headerDisp + offsetof(PackedQueueHeader, lbts_ver), 1, MPI_UNSIGNED_LONG_LONG, m_window);
         MPI_Win_flush(trgComm, m_window);
-        if (m_doorbellMode == DoorbellMode::TWO_SIDED) {
-            // const char* via = "WORLD";
-            // if (m_commKernelsCross != MPI_COMM_NULL && m_kxcommRankOfGlobal.count(trg)) via = "KxComm";
-            // else if (m_commKernelAgents != MPI_COMM_NULL && m_pkcommKernelLocalRank >= 0) via = "PerKernel";
-            // std::cout << "[DOORBELL][SEND] origin=" << m_rank << " -> kernel=" << trg
-            //           << " via=" << via << std::endl;
-            sendDoorbellNotifyToKernel(trg);
+        if (isSyncDoorbellEnabled()) {
+            sendDoorbellNotify(trg, SYNC_DOORBELL_TAG, "SYNC");
         }
         if (!m_lockedAll) {
             MPI_Win_unlock(trgComm, m_window);
@@ -443,60 +871,36 @@ void MPICommunicationManager::rmaWriteAgentLBTSHeartbeat() {
     }
 }
 
-void MPICommunicationManager::sendDoorbellNotifyToKernel() {
-    if (m_rank == m_simulationRank) return;
-    int one = 1;
-    MPI_Request req;
-    MPI_Isend(&one, 1, MPI_INT, m_simulationRank, DOORBELL_TAG, MPI_COMM_WORLD, &req);
-    MPI_Request_free(&req);
-}
-
-void MPICommunicationManager::sendDoorbellNotifyToKernel(int targetGlobalRank) {
-    if (m_rank == targetGlobalRank) return;
-    int one = 1;
-    MPI_Request req;
-    if (m_commKernelsCross != MPI_COMM_NULL) {
-        auto it = m_kxcommRankOfGlobal.find(targetGlobalRank);
-        if (it != m_kxcommRankOfGlobal.end()) {
-            int trgLocal = it->second;
-            MPI_Isend(&one, 1, MPI_INT, trgLocal, DOORBELL_TAG, m_commKernelsCross, &req);
-            MPI_Request_free(&req);
-            return;
-        }
-    }
-    if (m_commKernelAgents != MPI_COMM_NULL && m_pkcommKernelLocalRank >= 0) {
-        int trgLocal = m_pkcommKernelLocalRank;
-        MPI_Isend(&one, 1, MPI_INT, trgLocal, DOORBELL_TAG, m_commKernelAgents, &req);
-        MPI_Request_free(&req);
-        return;
-    }
-    MPI_Isend(&one, 1, MPI_INT, targetGlobalRank, DOORBELL_TAG, MPI_COMM_WORLD, &req);
-    MPI_Request_free(&req);
-}
-
 uint64_t MPICommunicationManager::getMinAgentLBTSFromLocalWindow() {
-    if (!m_useRMA || m_window == MPI_WIN_NULL) return UINT64_MAX;
-    if (m_rank != m_simulationRank) return UINT64_MAX;
+    return snapshotAgentLbtsWindow(false).minAgentLBTS;
+}
+
+MPICommunicationManager::AgentLbtsWindowSnapshot MPICommunicationManager::snapshotAgentLbtsWindow(bool updateDoorbellCache) {
+    AgentLbtsWindowSnapshot snapshot;
+    if (!m_useRMA || m_window == MPI_WIN_NULL) return snapshot;
+    if (m_rank != m_simulationRank) return snapshot;
 
     // PROXY mode: avoid MPI calls on non-MPI threads while workers are running.
     // The mpiProgressWorker periodically refreshes this cached value.
     if (isProxyMode() && m_running.load(std::memory_order_relaxed) && !g_desmar_in_mpi_progress_thread) {
         uint64_t v = m_cachedMinAgentLBTS.load(std::memory_order_relaxed);
-        // Preserve legacy semantics: 0 means "missing", UINT64_MAX means "unavailable".
-        if (v == UINT64_MAX) return 0;
-        return v;
+        snapshot.minAgentLBTS = (v == UINT64_MAX) ? 0ull : v;
+        snapshot.changed = false;
+        return snapshot;
     }
 
-    if (!m_isUnifiedModel) {
-        MPI_Win_sync(m_window);
-    }
+    const int localEpoch = beginMainWindowLocalAccess(false);
 
     uint64_t gmin = UINT64_MAX;
     bool anyMissing = false;
-    
+
     for (size_t idx = 0; idx < m_sliceCount; ++idx) {
         auto* hdr = localQueueHeaderByIndex(idx);
         uint64_t v1 = hdr->lbts_ver;
+        if (updateDoorbellCache && v1 != m_lastLbtsVerBySlice[idx]) {
+            m_lastLbtsVerBySlice[idx] = v1;
+            snapshot.changed = true;
+        }
         if (v1 == 0) { anyMissing = true; continue; }
         uint64_t a = hdr->lbts_value;
         uint64_t v2 = hdr->lbts_ver;
@@ -506,8 +910,9 @@ uint64_t MPICommunicationManager::getMinAgentLBTSFromLocalWindow() {
         if (a < gmin) gmin = a;
     }
 
-    if (anyMissing) return 0;
-    return gmin;
+    snapshot.minAgentLBTS = anyMissing ? 0ull : gmin;
+    endMainWindowLocalAccess(localEpoch, false);
+    return snapshot;
 }
 
 void MPICommunicationManager::rmaPublishGlobalLBTSToAgents(uint64_t g) {
@@ -534,15 +939,13 @@ void MPICommunicationManager::rmaPublishGlobalLBTSToAgents(uint64_t g) {
         return;
     }
 
-    // Collect all agent targets that should receive g from this kernel.
     std::vector<int> targets;
-    targets.reserve(m_agentRanks.size() + m_crossAgentRanks.size());
+    targets.reserve(m_agentRanks.size());
     for (int ar : m_agentRanks) {
         if (ar != m_rank) targets.push_back(ar);
     }
-    for (int cr : m_crossAgentRanks) {
-        if (cr != m_rank) targets.push_back(cr);
-    }
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
     if (targets.empty()) return;
 
     uint64_t ver = m_gVersionCounter.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -550,52 +953,20 @@ void MPICommunicationManager::rmaPublishGlobalLBTSToAgents(uint64_t g) {
     for (int trg : targets) {
         int trgComm = toWinCommRank(trg);
         if (trgComm < 0) continue;
-        // Determine remote layout (slice count + slice index for this kernel on that target).
-        size_t remoteSliceCount = 1;
-        size_t sliceIndex = 0;
-
-        if (m_crossAgentRanks.find(trg) != m_crossAgentRanks.end()) {
-            // Cross-agent windows may be sliced by multiple kernels.
-            std::vector<int> senders;
-            auto topoIt = m_crossAgentWindowTopology.find(trg);
-            if (topoIt != m_crossAgentWindowTopology.end()) {
-                senders = topoIt->second;
-            } else if (!m_kernelTargets.empty()) {
-                senders.assign(m_kernelTargets.begin(), m_kernelTargets.end());
-            } else {
-                // Fall back: if kernelTargets not configured, treat as single-sender.
-                senders = { m_rank };
-            }
-            std::sort(senders.begin(), senders.end());
-            senders.erase(std::unique(senders.begin(), senders.end()), senders.end());
-            remoteSliceCount = senders.empty() ? 1 : senders.size();
-            auto it = std::lower_bound(senders.begin(), senders.end(), m_rank);
-            if (it == senders.end() || *it != m_rank) {
-                // This kernel is not a sender for that cross-agent; skip publishing.
-                continue;
-            }
-            sliceIndex = static_cast<size_t>(std::distance(senders.begin(), it));
-        } else {
-            // Normal agent windows in per-kernel topology have exactly one sender (their kernel).
-            remoteSliceCount = 1;
-            sliceIndex = 0;
-        }
-
-        const size_t remoteWindowBytes = m_remoteAgentWindowSizeBytes;
-        if (remoteWindowBytes == 0 || remoteSliceCount == 0) continue;
-        const size_t remotePerRegionBytes = compute_aligned_region_bytes(remoteWindowBytes, remoteSliceCount);
-        if (remotePerRegionBytes == 0) continue;
-        if (remotePerRegionBytes < sizeof(PackedQueueHeader)) continue;
-        MPI_Aint hdrDisp = static_cast<MPI_Aint>(sliceIndex * remotePerRegionBytes);
+        RemoteWindowLayout layout;
+        if (!computeRemoteAgentWindowLayoutForKernel(trg, m_rank, layout)) continue;
 
         if (!m_lockedAll) {
             MPI_Win_lock(MPI_LOCK_EXCLUSIVE, trgComm, 0, m_window);
         }
         MPI_Put(&g, 1, MPI_UNSIGNED_LONG_LONG,
-                trgComm, hdrDisp + offsetof(PackedQueueHeader, g_value), 1, MPI_UNSIGNED_LONG_LONG, m_window);
+                trgComm, layout.headerDisp + offsetof(PackedQueueHeader, g_value), 1, MPI_UNSIGNED_LONG_LONG, m_window);
         MPI_Put(&ver, 1, MPI_UNSIGNED_LONG_LONG,
-                trgComm, hdrDisp + offsetof(PackedQueueHeader, g_ver), 1, MPI_UNSIGNED_LONG_LONG, m_window);
+                trgComm, layout.headerDisp + offsetof(PackedQueueHeader, g_ver), 1, MPI_UNSIGNED_LONG_LONG, m_window);
         MPI_Win_flush(trgComm, m_window);
+        if (isSyncDoorbellEnabled()) {
+            sendDoorbellNotify(trg, SYNC_DOORBELL_TAG, "SYNC");
+        }
         if (!m_lockedAll) {
             MPI_Win_unlock(trgComm, m_window);
         }
@@ -613,7 +984,7 @@ uint64_t MPICommunicationManager::getMinKernelGlobalLBTSFromLocalWindow() {
         return m_cachedKernelG.load(std::memory_order_relaxed);
     }
 
-    // Separate memory model needs sync to see remote updates.
+    // Refresh local public/private copies before sampling g in the SEPARATE memory model.
     if (!m_isUnifiedModel) {
         MPI_Win_sync(m_window);
     }
@@ -641,6 +1012,32 @@ uint64_t MPICommunicationManager::getMinKernelGlobalLBTSFromLocalWindow() {
 
 void MPICommunicationManager::startWorkers() {
     if (m_size > 1 && !m_running) {
+        if (m_doorbellMode == DoorbellMode::TWO_SIDED) {
+            MPI_Comm comm = doorbellCommunicator();
+            int drained = 0;
+            int flag = 0;
+            MPI_Status st;
+            auto drainDoorbellTag = [&](int tag) {
+                while (true) {
+                    flag = 0;
+                    MPI_Iprobe(MPI_ANY_SOURCE, tag, comm, &flag, &st);
+                    if (!flag) break;
+                    int dummy = 0;
+                    MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, tag, comm, MPI_STATUS_IGNORE);
+                    ++drained;
+                }
+            };
+            if (m_mainDoorbellEnabled) drainDoorbellTag(MAIN_DOORBELL_TAG);
+            if (m_syncDoorbellEnabled) drainDoorbellTag(SYNC_DOORBELL_TAG);
+            m_mainDoorbellPending.store(false, std::memory_order_relaxed);
+            m_syncDoorbellPending.store(false, std::memory_order_relaxed);
+            if (drained > 0) {
+                std::cout << "[MPI][Drain] rank=" << m_rank
+                          << " drained " << drained
+                          << " stale doorbell messages before starting workers"
+                          << std::endl;
+            }
+        }
         m_abortRmaPuts.store(false, std::memory_order_relaxed);
         m_running = true;
         if (isProxyMode()) {
@@ -732,8 +1129,136 @@ void MPICommunicationManager::barrierKernels() {
     MPI_Barrier(m_commKernels);
 }
 
+MPI_Comm MPICommunicationManager::normalizeIallreduceCommunicator(MPI_Comm comm) const {
+    if (comm != MPI_COMM_NULL) return comm;
+    if (m_commSimulation != MPI_COMM_NULL) return m_commSimulation;
+    return MPI_COMM_WORLD;
+}
+
+void MPICommunicationManager::resetIallreduceSessionLocked() {
+    m_iallreduceSession.req = MPI_REQUEST_NULL;
+    m_iallreduceSession.comm = MPI_COMM_NULL;
+    m_iallreduceSession.generation = m_iallreduceCommGeneration.load(std::memory_order_relaxed);
+    m_iallreduceSession.sendVal = 0;
+    m_iallreduceSession.recvVal = 0;
+    m_iallreduceSession.inFlight = false;
+}
+
+uint64_t MPICommunicationManager::encodeIallreduceValue(uint64_t sendVal, bool shutdownRequested) const {
+    if (shutdownRequested) {
+        return kIallreduceEncodedShutdown;
+    }
+    if (sendVal == UINT64_MAX) {
+        return kIallreduceEncodedInfinity;
+    }
+    if (sendVal > kIallreduceMaxFiniteValue) {
+        std::cerr << "[IALLREDUCE][FATAL] rank=" << m_rank
+                  << " sendVal=" << sendVal
+                  << " exceeds encodable range maxFinite=" << kIallreduceMaxFiniteValue
+                  << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 98);
+    }
+    return 1ull + (sendVal << 1u);
+}
+
+void MPICommunicationManager::decodeIallreduceValue(uint64_t encodedVal,
+                                                    uint64_t& outVal,
+                                                    bool& outShutdown) const {
+    if (encodedVal == kIallreduceEncodedShutdown) {
+        outShutdown = true;
+        outVal = 0;
+        return;
+    }
+    outShutdown = false;
+    if (encodedVal == kIallreduceEncodedInfinity) {
+        outVal = UINT64_MAX;
+        return;
+    }
+    outVal = (encodedVal - 1ull) >> 1u;
+}
+
+bool MPICommunicationManager::progressIallreduceSessionLocked(uint64_t sendVal,
+                                                              MPI_Comm comm,
+                                                              uint64_t& outVal,
+                                                              bool& haveResult) {
+    haveResult = false;
+    outVal = 0;
+    MPI_Comm resolvedComm = normalizeIallreduceCommunicator(comm);
+    const uint64_t currentGeneration = m_iallreduceCommGeneration.load(std::memory_order_relaxed);
+
+    if (m_iallreduceSession.inFlight) {
+        if (m_iallreduceSession.generation != currentGeneration || m_iallreduceSession.comm != resolvedComm) {
+            std::cerr << "[IALLREDUCE][FATAL] rank=" << m_rank
+                      << " communicator changed while Iallreduce request was in flight"
+                      << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 97);
+        }
+        int done = 0;
+        MPI_Test(&m_iallreduceSession.req, &done, MPI_STATUS_IGNORE);
+        if (!done) return false;
+
+        outVal = m_iallreduceSession.recvVal;
+        haveResult = true;
+        m_iallreduceSession.req = MPI_REQUEST_NULL;
+        m_iallreduceSession.inFlight = false;
+        return true;
+    }
+
+    m_iallreduceSession.comm = resolvedComm;
+    m_iallreduceSession.generation = currentGeneration;
+    m_iallreduceSession.sendVal = encodeIallreduceValue(
+        sendVal, m_iallreduceShutdownRequested.load(std::memory_order_acquire));
+    m_iallreduceSession.recvVal = 0;
+    uint64_t expectedLoggedGeneration = m_iallreduceLoggedGeneration.load(std::memory_order_relaxed);
+    if (expectedLoggedGeneration != currentGeneration &&
+        m_iallreduceLoggedGeneration.compare_exchange_strong(expectedLoggedGeneration,
+                                                            currentGeneration,
+                                                            std::memory_order_relaxed)) {
+        int commSize = -1;
+        int commRank = -1;
+        MPI_Comm_size(resolvedComm, &commSize);
+        MPI_Comm_rank(resolvedComm, &commRank);
+        std::cout << "[IALLREDUCE][COMM] rank=" << m_rank
+                  << " generation=" << currentGeneration
+                  << " commSize=" << commSize
+                  << " commRank=" << commRank
+                  << " commIsWorld=" << ((resolvedComm == MPI_COMM_WORLD) ? 1 : 0)
+                  << std::endl;
+    }
+    MPI_Iallreduce(&m_iallreduceSession.sendVal,
+                   &m_iallreduceSession.recvVal,
+                   1,
+                   MPI_UNSIGNED_LONG_LONG,
+                   MPI_MIN,
+                   resolvedComm,
+                   &m_iallreduceSession.req);
+    m_iallreduceSession.inFlight = true;
+    return false;
+}
+
+void MPICommunicationManager::finishIallreduceEpochSessionLocked(bool keepLastResult) {
+    if (m_iallreduceSession.inFlight) {
+        MPI_Wait(&m_iallreduceSession.req, MPI_STATUS_IGNORE);
+        m_iallreduceSession.req = MPI_REQUEST_NULL;
+        m_iallreduceSession.inFlight = false;
+    }
+    if (keepLastResult) {
+        m_proxyAllreduceRecv.store(m_iallreduceSession.recvVal, std::memory_order_relaxed);
+        m_proxyAllreduceRecvValid.store(true, std::memory_order_release);
+    } else {
+        m_proxyAllreduceRecv.store(0, std::memory_order_relaxed);
+        m_proxyAllreduceRecvValid.store(false, std::memory_order_release);
+    }
+    m_proxyAllreduceSend.store(0, std::memory_order_relaxed);
+    m_proxyAllreduceSendValid.store(false, std::memory_order_release);
+    resetIallreduceSessionLocked();
+}
+
 void MPICommunicationManager::proxyIallreduceSubmit(uint64_t sendVal, MPI_Comm comm) {
     // Safe from any thread: no MPI calls. The MPI progress thread will run the Iallreduce.
+    if (!m_running.load(std::memory_order_relaxed)) {
+        return;
+    }
     if (comm != MPI_COMM_NULL) {
         m_proxyAllreduceComm.store(comm, std::memory_order_relaxed);
     }
@@ -745,11 +1270,36 @@ void MPICommunicationManager::proxyIallreduceSubmit(uint64_t sendVal, MPI_Comm c
     }
 }
 
-bool MPICommunicationManager::proxyIallreduceTryConsume(uint64_t& outVal) {
+bool MPICommunicationManager::proxyIallreduceTryConsume(uint64_t& outVal, bool& outShutdown) {
+    outShutdown = false;
     if (!m_proxyAllreduceRecvValid.load(std::memory_order_acquire)) return false;
-    outVal = m_proxyAllreduceRecv.load(std::memory_order_relaxed);
+    decodeIallreduceValue(m_proxyAllreduceRecv.load(std::memory_order_relaxed), outVal, outShutdown);
     m_proxyAllreduceRecvValid.store(false, std::memory_order_release);
     return true;
+}
+
+bool MPICommunicationManager::advanceIallreduce(uint64_t sendVal,
+                                                MPI_Comm comm,
+                                                uint64_t& outVal,
+                                                bool& outShutdown) {
+    if (m_lbtsSyncMode != LBTSSyncMode::IALLREDUCE) return false;
+    outShutdown = false;
+    bool haveResult = false;
+    uint64_t encodedOutVal = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_iallreduceMutex);
+        progressIallreduceSessionLocked(sendVal, comm, encodedOutVal, haveResult);
+    }
+    if (haveResult) {
+        decodeIallreduceValue(encodedOutVal, outVal, outShutdown);
+    }
+    return haveResult;
+}
+
+void MPICommunicationManager::finishIallreduceEpochSession() {
+    if (m_lbtsSyncMode != LBTSSyncMode::IALLREDUCE) return;
+    std::lock_guard<std::mutex> lk(m_iallreduceMutex);
+    finishIallreduceEpochSessionLocked(false);
 }
 
 void MPICommunicationManager::quiesce() {
@@ -839,6 +1389,8 @@ void MPICommunicationManager::quiesce() {
         m_rmaStatsThread.join();
     }
 
+    finishIallreduceEpochSession();
+
     // Ensure all nonblocking sends are completed before tearing down MPI state.
     // This is the classic correctness requirement for Isend-based designs.
     {
@@ -897,6 +1449,24 @@ void MPICommunicationManager::freeWindows() {
 void MPICommunicationManager::shutdown() {
     // Compatible with old interface: ensure threads stop first, then release all RMA resources
     quiesce();
+    int mpiInitialized = 0;
+    int mpiFinalized = 0;
+    MPI_Initialized(&mpiInitialized);
+    if (mpiInitialized) {
+        MPI_Finalized(&mpiFinalized);
+    }
+    if (mpiInitialized && !mpiFinalized && m_window != MPI_WIN_NULL && m_windowComm != MPI_COMM_NULL) {
+        int windowCommSize = -1;
+        MPI_Comm_size(m_windowComm, &windowCommSize);
+        std::cout << "[MPI][TEARDOWN_BARRIER] rank=" << m_rank
+                  << " before freeWindows() comm=window"
+                  << " commSize=" << windowCommSize
+                  << " includesWorld=" << (m_windowCommIsWorld ? 1 : 0)
+                  << std::endl;
+        MPI_Barrier(m_windowComm);
+        std::cout << "[MPI][TEARDOWN_BARRIER] rank=" << m_rank
+                  << " after window barrier" << std::endl;
+    }
     freeWindows();
     if (m_simGroup != MPI_GROUP_NULL) { MPI_Group_free(&m_simGroup); m_simGroup = MPI_GROUP_NULL; }
     if (m_worldGroup != MPI_GROUP_NULL) { MPI_Group_free(&m_worldGroup); m_worldGroup = MPI_GROUP_NULL; }
@@ -958,7 +1528,7 @@ void MPICommunicationManager::sendWorker() {
                 //           << " bytes=" << serializedData.size()
                 //           << " seq=" << seq32
                 //           << std::endl;
-                if (m_mainCommMode == MainCommMode::TWO_SIDED) {
+                if (m_mainCommMode == MainCommMode::TWO_SIDED || should_force_two_sided_control_message(msg.get())) {
                     const int tag = isControlMessageType(msg->type) ? MAIN_CTRL_TAG : MAIN_MSG_TAG;
                     // Classic nonblocking send: keep buffer alive until request completes.
                     auto buf = std::make_shared<std::vector<char>>(std::move(serializedData));
@@ -975,7 +1545,7 @@ void MPICommunicationManager::sendWorker() {
                         m_isendPending.push_back(PendingIsend{req, buf, 0});
                     }
                 } else {
-                    rmaPut(serializedData, msg->targetRank, seq32);
+                    rmaPut(serializedData, msg->targetRank, seq32, msg.get());
                 }
                 
             } catch (const std::exception& e) {
@@ -988,77 +1558,21 @@ void MPICommunicationManager::sendWorker() {
 
 void MPICommunicationManager::receiveWorker() {
     DesmarMpiApiProfiler::RegisterThreadLabel("mpi.receiveWorker");
-    // Always-on diagnostic: confirm mailbox poll loop is running on each rank.
-    // Printed once per process.
-    {
-        static std::mutex s_mu;
-        static std::unordered_set<int> s_printed;
-        bool first = false;
-        { std::lock_guard<std::mutex> lk(s_mu); first = s_printed.insert(m_rank).second; }
-        if (first) {
-            std::cout << "[STOP_MAILBOX][POLL_INIT] rank=" << m_rank
-                      << " useRMA=" << (m_useRMA ? 1 : 0)
-                      << " windowNull=" << (m_window == MPI_WIN_NULL ? 1 : 0)
-                      << " simRank=" << m_simulationRank
-                      << " sliceCount=" << m_sliceCount
-                      << " unified=" << (m_isUnifiedModel ? 1 : 0)
-                      << " windowCommIsWorld=" << (m_windowCommIsWorld ? 1 : 0)
-                      << std::endl;
-        }
-    }
     while (m_running) {
         try {
             collectCompletedIsends();
-            // Poll STOP mailbox (Kernel->Agent) so shutdown does not rely on ring delivery.
-            if (m_useRMA && m_window != MPI_WIN_NULL && m_rank != m_simulationRank) {
-                if (!m_isUnifiedModel) { MPI_Win_sync(m_window); }
-                for (size_t idx = 0; idx < m_sliceCount; ++idx) {
-                    auto* hdr = localQueueHeaderByIndex(idx);
-                    uint64_t v1 = hdr->stop_cmd_ver;
-                    if (v1 == 0 || v1 == m_lastStopCmdVerBySlice[idx]) continue;
-                    uint64_t cmd = hdr->stop_cmd;
-                    uint64_t v2 = hdr->stop_cmd_ver;
-                    if (v1 != v2) continue;
-                    m_lastStopCmdVerBySlice[idx] = v2;
-                    if (cmd != 1) continue;
-                    int sender = (idx < m_sliceSenderRanks.size()) ? m_sliceSenderRanks[idx] : -1;
-                    if (sender < 0) continue;
-                    // Always-on diagnostic: STOP_CMD mailbox receive (once per sender).
-                    {
-                        static std::mutex s_mu;
-                        static std::unordered_set<int> s_seenSenders;
-                        bool first = false;
-                        {
-                            std::lock_guard<std::mutex> lk(s_mu);
-                            first = s_seenSenders.insert(sender).second;
-                        }
-                        if (first) {
-                            std::cout << "[STOP_MAILBOX][CMD_RECV] rank=" << m_rank
-                                      << " <- kernel=" << sender
-                                      << " cmd=STOP"
-                                      << " sliceIdx=" << idx
-                                      << " ver=" << v2
-                                      << std::endl;
-                        }
-                    }
-                    // Synthesize STOP message into the normal handler path (idempotent at router level).
-                    Message base(0, 0, "SIMULATION", std::vector<std::string>{"*"}, "EVENT_SIMULATION_STOP", nullptr);
-                    auto dmsg = std::make_shared<DistributedMessage>(base);
-                    dmsg->sourceRank = sender;
-                    dmsg->targetRank = m_rank;
-                    if (m_messageHandler) {
-                        dmsg->isLocalMessage = false;
-                        m_messageHandler(dmsg);
-                    }
-                }
-            }
             // Two-sided baseline receive path (stable): optional LBTS drains + main channel drains.
             if (m_lbtsSyncMode == LBTSSyncMode::TWO_SIDED) {
                 pollTwoSidedLBTSSyncMessages();
                 pollTwoSidedKernelClockMessages();
             }
-            auto messages = (m_mainCommMode == MainCommMode::TWO_SIDED) ? checkTwoSidedMessages()
-                                                                       : checkRMAMessages();
+            auto messages = checkTwoSidedMessages();
+            if (m_mainCommMode != MainCommMode::TWO_SIDED) {
+                auto rmaMessages = checkRMAMessages();
+                messages.reserve(messages.size() + rmaMessages.size());
+                for (auto& m : rmaMessages) messages.push_back(std::move(m));
+            }
+            const bool hadMainMessages = !messages.empty();
             {
                 std::lock_guard<std::mutex> lk(m_incomingMutex);
                 for (auto& m : messages) if (m) m_incomingQueue.push(m);
@@ -1075,40 +1589,18 @@ void MPICommunicationManager::receiveWorker() {
                 if (next && m_messageHandler) { next->isLocalMessage = false; m_messageHandler(next); }
             }
             if (m_doorbellMode == DoorbellMode::TWO_SIDED) {
-                int flag = 0; MPI_Status st;
-                if (m_commKernelsCross != MPI_COMM_NULL) {
-                    do {
-                        flag = 0;
-                        MPI_Iprobe(MPI_ANY_SOURCE, DOORBELL_TAG, m_commKernelsCross, &flag, &st);
-                        if (flag) {
-                            int dummy = 0;
-                            MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, DOORBELL_TAG, m_commKernelsCross, &st);
-                            m_doorbellPending.store(true, std::memory_order_release);
-                        }
-                    } while (flag);
+                if (isSyncDoorbellEnabled()) {
+                    drainDoorbellMessages(SYNC_DOORBELL_TAG, m_syncDoorbellPending, "SYNC");
                 }
-                if (m_commKernelAgents != MPI_COMM_NULL) {
-                    do {
-                        flag = 0;
-                        MPI_Iprobe(MPI_ANY_SOURCE, DOORBELL_TAG, m_commKernelAgents, &flag, &st);
-                        if (flag) {
-                            int dummy = 0;
-                            MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, DOORBELL_TAG, m_commKernelAgents, &st);
-                            m_doorbellPending.store(true, std::memory_order_release);
-                        }
-                    } while (flag);
+                if (isMainDoorbellEnabled()) {
+                    drainDoorbellMessages(MAIN_DOORBELL_TAG, m_mainDoorbellPending, "MAIN");
                 }
-                do {
-                    flag = 0;
-                    MPI_Iprobe(MPI_ANY_SOURCE, DOORBELL_TAG, MPI_COMM_WORLD, &flag, &st);
-                    if (flag) {
-                        int dummy = 0;
-                        MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, DOORBELL_TAG, MPI_COMM_WORLD, &st);
-                        m_doorbellPending.store(true, std::memory_order_release);
-                    }
-                } while (flag);
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(m_rmaPollSleepMicros));
+
+            const auto idleWait = computeReceiveIdleWait(hadMainMessages);
+            if (idleWait.count() > 0) {
+                std::this_thread::sleep_for(idleWait);
+            }
             
         } catch (const std::exception& e) {
             std::cerr << "Error receiving message: " << e.what() << std::endl;
@@ -1145,7 +1637,7 @@ void MPICommunicationManager::drainProxyOpsOnMpiThread() {
                         auto serializedData = serializeMessage(*msg);
                         msg->wireSizeBytes = serializedData.size();
                         uint32_t seq32 = 0;
-                        if (m_mainCommMode == MainCommMode::TWO_SIDED) {
+                        if (m_mainCommMode == MainCommMode::TWO_SIDED || should_force_two_sided_control_message(msg.get())) {
                             const int tag = isControlMessageType(msg->type) ? MAIN_CTRL_TAG : MAIN_MSG_TAG;
                             auto buf = std::make_shared<std::vector<char>>(std::move(serializedData));
                             MPI_Request req = MPI_REQUEST_NULL;
@@ -1161,7 +1653,7 @@ void MPICommunicationManager::drainProxyOpsOnMpiThread() {
                                 m_isendPending.push_back(PendingIsend{req, buf, 0});
                             }
                         } else {
-                            rmaPut(serializedData, msg->targetRank, seq32);
+                            rmaPut(serializedData, msg->targetRank, seq32, msg.get());
                         }
                     }
                     if (m_commKernelAgents != MPI_COMM_NULL) {
@@ -1184,7 +1676,7 @@ void MPICommunicationManager::drainProxyOpsOnMpiThread() {
                         auto serializedData = serializeMessage(*msg);
                         msg->wireSizeBytes = serializedData.size();
                         uint32_t seq32 = 0;
-                        if (m_mainCommMode == MainCommMode::TWO_SIDED) {
+                        if (m_mainCommMode == MainCommMode::TWO_SIDED || should_force_two_sided_control_message(msg.get())) {
                             const int tag = isControlMessageType(msg->type) ? MAIN_CTRL_TAG : MAIN_MSG_TAG;
                             auto buf = std::make_shared<std::vector<char>>(std::move(serializedData));
                             MPI_Request req = MPI_REQUEST_NULL;
@@ -1200,7 +1692,7 @@ void MPICommunicationManager::drainProxyOpsOnMpiThread() {
                                 m_isendPending.push_back(PendingIsend{req, buf, 0});
                             }
                         } else {
-                            rmaPut(serializedData, msg->targetRank, seq32);
+                            rmaPut(serializedData, msg->targetRank, seq32, msg.get());
                         }
                     }
                     if (m_commKernels != MPI_COMM_NULL) {
@@ -1225,15 +1717,6 @@ void MPICommunicationManager::drainProxyOpsOnMpiThread() {
                     m_proxyRmaGExecuted.fetch_add(1, std::memory_order_relaxed);
                     const uint64_t g = m_proxyLatestRmaG.load(std::memory_order_relaxed);
                     rmaPublishGlobalLBTSToAgents(g);
-                    break;
-                }
-                case ProxyOpType::RMA_PUBLISH_STOP_CMD_TO_AGENTS: {
-                    rmaPublishStopCommandToAgents(op.ranks);
-                    break;
-                }
-                case ProxyOpType::RMA_WRITE_STOP_STATE_TO_KERNEL: {
-                    rmaWriteStopStateToKernel(op.rank, op.u64a);
-                    if (op.doneVoid) op.doneVoid->set_value();
                     break;
                 }
                 case ProxyOpType::TWO_SIDED_SEND_AGENT_LBTS_HB: {
@@ -1348,36 +1831,25 @@ void MPICommunicationManager::proxyIallreduceTickOnMpiThread() {
     if (m_lbtsSyncMode != LBTSSyncMode::IALLREDUCE) return;
     if (!m_running.load(std::memory_order_relaxed)) return;
 
-    static thread_local MPI_Request req = MPI_REQUEST_NULL;
-    static thread_local uint64_t sendVal = 0;
-    static thread_local uint64_t recvVal = 0;
+    const MPI_Comm comm = normalizeIallreduceCommunicator(m_proxyAllreduceComm.load(std::memory_order_relaxed));
+    uint64_t outVal = 0;
+    bool haveResult = false;
 
-    MPI_Comm comm = m_proxyAllreduceComm.load(std::memory_order_relaxed);
-    if (comm == MPI_COMM_NULL) {
-        // Fallback: use simulation communicator when configured, otherwise WORLD.
-        comm = (m_commSimulation == MPI_COMM_NULL) ? MPI_COMM_WORLD : m_commSimulation;
-        if (comm == MPI_COMM_NULL) comm = MPI_COMM_WORLD;
-        m_proxyAllreduceComm.store(comm, std::memory_order_relaxed);
-    }
-
-    if (req == MPI_REQUEST_NULL) {
-        if (m_proxyAllreduceSendValid.load(std::memory_order_acquire)) {
-            sendVal = m_proxyAllreduceSend.load(std::memory_order_relaxed);
-            // Start one nonblocking Iallreduce (MIN).
-            MPI_Iallreduce(&sendVal, &recvVal, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm, &req);
-            // Clear "sendValid" so producers can stage the next value.
+    {
+        std::lock_guard<std::mutex> lk(m_iallreduceMutex);
+        if (m_iallreduceSession.inFlight) {
+            progressIallreduceSessionLocked(0, comm, outVal, haveResult);
+        } else if (m_proxyAllreduceSendValid.load(std::memory_order_acquire)) {
+            const uint64_t sendVal = m_proxyAllreduceSend.load(std::memory_order_relaxed);
+            progressIallreduceSessionLocked(sendVal, comm, outVal, haveResult);
             m_proxyAllreduceSendValid.store(false, std::memory_order_release);
         }
-        return;
     }
 
-    int done = 0;
-    MPI_Test(&req, &done, MPI_STATUS_IGNORE);
-    if (!done) return;
-
-    req = MPI_REQUEST_NULL;
-    m_proxyAllreduceRecv.store(recvVal, std::memory_order_relaxed);
-    m_proxyAllreduceRecvValid.store(true, std::memory_order_release);
+    if (haveResult) {
+        m_proxyAllreduceRecv.store(outVal, std::memory_order_relaxed);
+        m_proxyAllreduceRecvValid.store(true, std::memory_order_release);
+    }
 }
 
 void MPICommunicationManager::progressWorker() {
@@ -1468,7 +1940,7 @@ void MPICommunicationManager::progressWorker() {
                     auto serializedData = serializeMessage(*msg);
                     msg->wireSizeBytes = serializedData.size();
                     uint32_t seq32 = 0;
-                    if (m_mainCommMode == MainCommMode::TWO_SIDED) {
+                    if (m_mainCommMode == MainCommMode::TWO_SIDED || should_force_two_sided_control_message(msg.get())) {
                         const int tag = isControlMessageType(msg->type) ? MAIN_CTRL_TAG : MAIN_MSG_TAG;
                         auto buf = std::make_shared<std::vector<char>>(std::move(serializedData));
                         MPI_Request req = MPI_REQUEST_NULL;
@@ -1484,7 +1956,7 @@ void MPICommunicationManager::progressWorker() {
                             m_isendPending.push_back(PendingIsend{req, buf, 0});
                         }
                     } else {
-                        rmaPut(serializedData, msg->targetRank, seq32);
+                        rmaPut(serializedData, msg->targetRank, seq32, msg.get());
                     }
                 } catch (const std::exception& e) {
                     std::cerr << "[DESMAR_MPI_PROXY][SEND][ERR] rank=" << m_rank << " err=" << e.what() << std::endl;
@@ -1492,39 +1964,19 @@ void MPICommunicationManager::progressWorker() {
             }
 
             // 4) Inbound polling (receive path).
-            // STOP mailbox (Kernel->Agent) so shutdown does not rely on ring delivery.
-            if (m_useRMA && m_window != MPI_WIN_NULL && m_rank != m_simulationRank) {
-                if (!m_isUnifiedModel) { MPI_Win_sync(m_window); }
-                for (size_t idx = 0; idx < m_sliceCount; ++idx) {
-                    auto* hdr = localQueueHeaderByIndex(idx);
-                    uint64_t v1 = hdr->stop_cmd_ver;
-                    if (v1 == 0 || v1 == m_lastStopCmdVerBySlice[idx]) continue;
-                    uint64_t cmd = hdr->stop_cmd;
-                    uint64_t v2 = hdr->stop_cmd_ver;
-                    if (v1 != v2) continue;
-                    m_lastStopCmdVerBySlice[idx] = v2;
-                    if (cmd != 1) continue;
-                    int sender = (idx < m_sliceSenderRanks.size()) ? m_sliceSenderRanks[idx] : -1;
-                    if (sender < 0) continue;
-                    Message base(0, 0, "SIMULATION", std::vector<std::string>{"*"}, "EVENT_SIMULATION_STOP", nullptr);
-                    auto dmsg = std::make_shared<DistributedMessage>(base);
-                    dmsg->sourceRank = sender;
-                    dmsg->targetRank = m_rank;
-                    if (m_messageHandler) {
-                        dmsg->isLocalMessage = false;
-                        m_messageHandler(dmsg);
-                    }
-                }
-            }
-
             // Two-sided LBTS sync drains (if configured).
             if (m_lbtsSyncMode == LBTSSyncMode::TWO_SIDED) {
                 pollTwoSidedLBTSSyncMessages();
                 pollTwoSidedKernelClockMessages();
             }
 
-            auto messages = (m_mainCommMode == MainCommMode::TWO_SIDED) ? checkTwoSidedMessages()
-                                                                       : checkRMAMessages();
+            auto messages = checkTwoSidedMessages();
+            if (m_mainCommMode != MainCommMode::TWO_SIDED) {
+                auto rmaMessages = checkRMAMessages();
+                messages.reserve(messages.size() + rmaMessages.size());
+                for (auto& m : rmaMessages) messages.push_back(std::move(m));
+            }
+            const bool hadMainMessages = !messages.empty();
             {
                 std::lock_guard<std::mutex> lk(m_incomingMutex);
                 for (auto& m : messages) if (m) m_incomingQueue.push(m);
@@ -1545,46 +1997,21 @@ void MPICommunicationManager::progressWorker() {
 
             // Doorbell drains (two-sided).
             if (m_doorbellMode == DoorbellMode::TWO_SIDED) {
-                int flag = 0; MPI_Status st;
-                if (m_commKernelsCross != MPI_COMM_NULL) {
-                    do {
-                        flag = 0;
-                        MPI_Iprobe(MPI_ANY_SOURCE, DOORBELL_TAG, m_commKernelsCross, &flag, &st);
-                        if (flag) {
-                            int dummy = 0;
-                            MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, DOORBELL_TAG, m_commKernelsCross, &st);
-                            m_doorbellPending.store(true, std::memory_order_release);
-                        }
-                    } while (flag);
+                if (isSyncDoorbellEnabled()) {
+                    drainDoorbellMessages(SYNC_DOORBELL_TAG, m_syncDoorbellPending, "SYNC");
                 }
-                if (m_commKernelAgents != MPI_COMM_NULL) {
-                    do {
-                        flag = 0;
-                        MPI_Iprobe(MPI_ANY_SOURCE, DOORBELL_TAG, m_commKernelAgents, &flag, &st);
-                        if (flag) {
-                            int dummy = 0;
-                            MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, DOORBELL_TAG, m_commKernelAgents, &st);
-                            m_doorbellPending.store(true, std::memory_order_release);
-                        }
-                    } while (flag);
+                if (isMainDoorbellEnabled()) {
+                    drainDoorbellMessages(MAIN_DOORBELL_TAG, m_mainDoorbellPending, "MAIN");
                 }
-                do {
-                    flag = 0;
-                    MPI_Iprobe(MPI_ANY_SOURCE, DOORBELL_TAG, MPI_COMM_WORLD, &flag, &st);
-                    if (flag) {
-                        int dummy = 0;
-                        MPI_Recv(&dummy, 1, MPI_INT, st.MPI_SOURCE, DOORBELL_TAG, MPI_COMM_WORLD, &st);
-                        m_doorbellPending.store(true, std::memory_order_release);
-                    }
-                } while (flag);
             }
 
             // 5) Refresh proxy-safe cached snapshots (g / agentsMin).
             proxyUpdateCachedSnapshotsOnMpiThread();
 
             // 6) Throttle loop.
+            const auto idleWait = computeReceiveIdleWait(hadMainMessages);
             std::unique_lock<std::mutex> lk(m_outgoingMutex);
-            m_outgoingCV.wait_for(lk, sleepDur, [this] {
+            m_outgoingCV.wait_for(lk, idleWait, [this] {
                 return !m_outgoingQueue.empty() || !m_running.load(std::memory_order_relaxed);
             });
         } catch (const std::exception& e) {
@@ -1607,342 +2034,19 @@ void MPICommunicationManager::processIncomingMessages() {
         return;
     }
 
-    // Fallback: Poll STOP mailbox (Kernel->Agent) when receiveWorker is not running.
-    if (m_useRMA && m_window != MPI_WIN_NULL && m_rank != m_simulationRank) {
-        if (!m_isUnifiedModel) { MPI_Win_sync(m_window); }
-        for (size_t idx = 0; idx < m_sliceCount; ++idx) {
-            auto* hdr = localQueueHeaderByIndex(idx);
-            uint64_t v1 = hdr->stop_cmd_ver;
-            if (v1 == 0 || v1 == m_lastStopCmdVerBySlice[idx]) continue;
-            uint64_t cmd = hdr->stop_cmd;
-            uint64_t v2 = hdr->stop_cmd_ver;
-            if (v1 != v2) continue;
-            m_lastStopCmdVerBySlice[idx] = v2;
-            if (cmd != 1) continue;
-            int sender = (idx < m_sliceSenderRanks.size()) ? m_sliceSenderRanks[idx] : -1;
-            if (sender < 0) continue;
-            Message base(0, 0, "SIMULATION", std::vector<std::string>{"*"}, "EVENT_SIMULATION_STOP", nullptr);
-            auto dmsg = std::make_shared<DistributedMessage>(base);
-            dmsg->sourceRank = sender;
-            dmsg->targetRank = m_rank;
-            if (m_messageHandler) {
-                dmsg->isLocalMessage = false;
-                m_messageHandler(dmsg);
-            }
-        }
-    }
-
     // Fallback: Drain main inbound channel for progress (exactly one path based on selected main mode).
-    if (m_mainCommMode == MainCommMode::TWO_SIDED) {
-        auto messages = checkTwoSidedMessages();
-        for (auto& msg : messages) {
-            if (msg && m_messageHandler) {
-                msg->isLocalMessage = false;
-                m_messageHandler(msg);
-            }
-        }
-    } else {
-        auto messages = checkRMAMessages();
-        for (auto& msg : messages) {
-            if (msg && m_messageHandler) {
-                msg->isLocalMessage = false;
-                m_messageHandler(msg);
-            }
+    auto messages = checkTwoSidedMessages();
+    if (m_mainCommMode != MainCommMode::TWO_SIDED) {
+        auto rmaMessages = checkRMAMessages();
+        messages.reserve(messages.size() + rmaMessages.size());
+        for (auto& msg : rmaMessages) messages.push_back(std::move(msg));
+    }
+    for (auto& msg : messages) {
+        if (msg && m_messageHandler) {
+            msg->isLocalMessage = false;
+            m_messageHandler(msg);
         }
     }
-}
-
-void MPICommunicationManager::rmaWriteStopStateToKernel(int kernelRank, uint64_t state) {
-    if (!m_useRMA || m_window == MPI_WIN_NULL) return;
-    if (kernelRank < 0) return;
-    if (state != 1 && state != 2) return;
-    if (m_rank == kernelRank) return;
-    // PROXY mode: queue to the MPI progress thread if called from a non-MPI thread.
-    if (isProxyMode() && m_running.load(std::memory_order_relaxed) && !g_desmar_in_mpi_progress_thread) {
-        ProxyOp op;
-        op.type = ProxyOpType::RMA_WRITE_STOP_STATE_TO_KERNEL;
-        op.rank = kernelRank;
-        op.u64a = state;
-        // CRITICAL (shutdown correctness):
-        // When an agent/cross rank transitions to STOPPED, the kernel must be able to observe it
-        // (either via ring ACK_STOPPED or via this mailbox) BEFORE any global barrier/quiesce happens.
-        //
-        // In PROXY mode this call does NOT execute MPI here; it enqueues a ProxyOp. If we return
-        // immediately and the caller proceeds to quiesce()/MPI_Barrier, the progress thread may stop
-        // before the mailbox Put+flush is executed, causing missing ACK_STOPPED and kernel-side abort.
-        //
-        // Therefore: for STOPPED state, synchronously wait for the ProxyOp to complete (bounded).
-        std::shared_ptr<std::promise<void>> done;
-        std::future<void> fut;
-        const bool mustWait = (state == 2);
-        if (mustWait) {
-            done = std::make_shared<std::promise<void>>();
-            fut = done->get_future();
-            op.doneVoid = done;
-        }
-        {
-            std::lock_guard<std::mutex> lk(m_proxyMutex);
-            m_proxyOps.push_back(std::move(op));
-        }
-        m_outgoingCV.notify_one();
-        if (mustWait) {
-            using namespace std::chrono;
-            // Bound the wait to avoid hanging forever if MPI is already tearing down.
-            // If this times out, the caller may still proceed, but kernel-side STOP mailbox may be incomplete.
-            const auto st = fut.wait_for(milliseconds(3000));
-            if (st != std::future_status::ready) {
-                std::cerr << "[STOP_MAILBOX][WARN] rank=" << m_rank
-                          << " timeout waiting STOPPED mailbox write to kernel=" << kernelRank
-                          << " (proxy op may be dropped during quiesce)" << std::endl;
-            }
-        }
-        return;
-    }
-
-    // Determine slice index for this sender on the target kernel window.
-    std::vector<int> targetAgentRanks;
-    auto itAR = m_agentRanksByKernel.find(kernelRank);
-    if (itAR != m_agentRanksByKernel.end()) {
-        targetAgentRanks = itAR->second;
-    } else if (kernelRank == m_simulationRank) {
-        targetAgentRanks = m_agentRanks;
-    }
-    auto itCross = m_crossAgentRanksByKernel.find(kernelRank);
-    if (itCross != m_crossAgentRanksByKernel.end()) {
-        for (int cr : itCross->second) targetAgentRanks.push_back(cr);
-        std::sort(targetAgentRanks.begin(), targetAgentRanks.end());
-        targetAgentRanks.erase(std::unique(targetAgentRanks.begin(), targetAgentRanks.end()), targetAgentRanks.end());
-    }
-    if (targetAgentRanks.empty()) return;
-    auto itPos = std::find(targetAgentRanks.begin(), targetAgentRanks.end(), m_rank);
-    if (itPos == targetAgentRanks.end()) return;
-    const size_t sliceIndex = static_cast<size_t>(std::distance(targetAgentRanks.begin(), itPos));
-    const size_t remoteSliceCount = targetAgentRanks.size();
-    size_t remoteWindowBytes = 0;
-    auto itW = m_remoteKernelWindowSizeByKernel.find(kernelRank);
-    remoteWindowBytes = (itW != m_remoteKernelWindowSizeByKernel.end()) ? itW->second : m_remoteKernelWindowSizeBytes;
-    if (remoteWindowBytes == 0 || remoteSliceCount == 0) return;
-    const size_t remotePerRegionBytes = compute_aligned_region_bytes(remoteWindowBytes, remoteSliceCount);
-    if (remotePerRegionBytes == 0) return;
-    if (remotePerRegionBytes < sizeof(PackedQueueHeader)) return;
-    const MPI_Aint hdrDisp = static_cast<MPI_Aint>(sliceIndex * remotePerRegionBytes);
-
-    const int trgComm = toWinCommRank(kernelRank);
-    if (trgComm < 0) return;
-
-    uint64_t ver = m_stopVersionCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (!m_lockedAll) {
-        MPI_Win_lock(MPI_LOCK_EXCLUSIVE, trgComm, 0, m_window);
-    }
-    MPI_Put(&state, 1, MPI_UNSIGNED_LONG_LONG,
-            trgComm, hdrDisp + offsetof(PackedQueueHeader, stop_state), 1, MPI_UNSIGNED_LONG_LONG, m_window);
-    MPI_Put(&ver, 1, MPI_UNSIGNED_LONG_LONG,
-            trgComm, hdrDisp + offsetof(PackedQueueHeader, stop_ver), 1, MPI_UNSIGNED_LONG_LONG, m_window);
-    MPI_Win_flush(trgComm, m_window);
-    if (!m_lockedAll) {
-        MPI_Win_unlock(trgComm, m_window);
-    }
-
-    // Minimal confirmation log (once per target kernel) for STOPPED mailbox write.
-    if (state == 2) {
-        static std::mutex s_mu;
-        static std::unordered_set<int> s_printedKernels;
-        bool first = false;
-        {
-            std::lock_guard<std::mutex> lk(s_mu);
-            first = s_printedKernels.insert(kernelRank).second;
-        }
-        if (first) {
-            std::cout << "[STOP_MAILBOX][STATE_WRITE] rank=" << m_rank
-                      << " -> kernel=" << kernelRank
-                      << " state=STOPPED"
-                      << std::endl;
-        }
-    }
-}
-
-std::vector<int> MPICommunicationManager::rmaGetStoppedAgentRanksFromLocalWindow(const std::vector<int>& agentRanks) {
-    std::vector<int> out;
-    if (!m_useRMA || m_window == MPI_WIN_NULL) return out;
-    // Only kernel windows should be read for STOPPED mailbox.
-    if (m_rank != m_simulationRank) return out;
-
-    // Separate model needs sync to see remote updates.
-    if (!m_isUnifiedModel) {
-        MPI_Win_sync(m_window);
-    }
-
-    out.reserve(agentRanks.size());
-    for (int ar : agentRanks) {
-        auto it = m_senderToIndex.find(ar);
-        if (it == m_senderToIndex.end()) continue;
-        const size_t idx = static_cast<size_t>(it->second);
-        if (idx >= m_sliceCount) continue;
-        auto* hdr = localQueueHeaderByIndex(idx);
-        uint64_t v1 = hdr->stop_ver;
-        if (v1 == 0) continue;
-        uint64_t st = hdr->stop_state;
-        uint64_t v2 = hdr->stop_ver;
-        if (v1 != v2) continue;
-        if (st == 2) {
-            out.push_back(ar);
-        }
-    }
-    return out;
-}
-
-void MPICommunicationManager::rmaPublishStopCommandToAgents(const std::vector<int>& agentRanks) {
-    if (!m_useRMA || m_window == MPI_WIN_NULL) return;
-    // Only kernel ranks publish STOP commands.
-    if (m_rank != m_simulationRank) return;
-    if (agentRanks.empty()) return;
-    // PROXY mode: queue to the MPI progress thread if called from a non-MPI thread.
-    if (isProxyMode() && m_running.load(std::memory_order_relaxed) && !g_desmar_in_mpi_progress_thread) {
-        ProxyOp op;
-        op.type = ProxyOpType::RMA_PUBLISH_STOP_CMD_TO_AGENTS;
-        op.ranks = agentRanks;
-        {
-            std::lock_guard<std::mutex> lk(m_proxyMutex);
-            m_proxyOps.push_back(std::move(op));
-        }
-        m_outgoingCV.notify_one();
-        return;
-    }
-
-    uint64_t cmd = 1;
-    uint64_t ver = m_stopCmdVersionCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-
-    size_t ok = 0, skipNotInComm = 0, skipTooSmall = 0;
-    std::vector<int> skippedNotInComm;
-    std::vector<int> skippedTooSmall;
-    for (int trg : agentRanks) {
-        if (trg == m_rank) continue;
-        const int trgComm = toWinCommRank(trg);
-        if (trgComm < 0) {
-            ++skipNotInComm;
-            skippedNotInComm.push_back(trg);
-            continue;
-        }
-
-        // Determine remote slice layout for target agent window.
-        //
-        // CRITICAL:
-        // - Normal agent windows are single-sender (their kernel) -> remoteSliceCount=1, sliceIndex=0.
-        // - Cross-agent windows may be multi-sender -> use crossAgentWindowTopology (or fallbacks) to compute sliceIndex.
-        bool isCross = (m_crossAgentRanks.find(trg) != m_crossAgentRanks.end());
-        size_t sliceIndex = 0;
-        size_t remoteSliceCount = 1;
-        if (isCross) {
-            std::vector<int> senders;
-            auto topoIt = m_crossAgentWindowTopology.find(trg);
-            if (topoIt != m_crossAgentWindowTopology.end() && !topoIt->second.empty()) {
-                senders = topoIt->second;
-            } else if (!m_kernelTargets.empty()) {
-                senders.assign(m_kernelTargets.begin(), m_kernelTargets.end());
-            } else {
-                senders = { m_rank };
-            }
-            std::sort(senders.begin(), senders.end());
-            senders.erase(std::unique(senders.begin(), senders.end()), senders.end());
-            if (senders.empty()) continue;
-            auto it = std::lower_bound(senders.begin(), senders.end(), m_rank);
-            if (it == senders.end() || *it != m_rank) {
-                // This kernel is not a sender for that target's window layout.
-                continue;
-            }
-            sliceIndex = static_cast<size_t>(std::distance(senders.begin(), it));
-            remoteSliceCount = senders.size();
-        }
-
-        const size_t remoteWindowBytes = m_remoteAgentWindowSizeBytes;
-        if (remoteWindowBytes == 0 || remoteSliceCount == 0) continue;
-        const size_t remotePerRegionBytes = compute_aligned_region_bytes(remoteWindowBytes, remoteSliceCount);
-        if (remotePerRegionBytes == 0) continue;
-        if (remotePerRegionBytes < sizeof(PackedQueueHeader)) {
-            ++skipTooSmall;
-            skippedTooSmall.push_back(trg);
-            continue;
-        }
-        const MPI_Aint hdrDisp = static_cast<MPI_Aint>(sliceIndex * remotePerRegionBytes);
-
-        if (!m_lockedAll) {
-            MPI_Win_lock(MPI_LOCK_EXCLUSIVE, trgComm, 0, m_window);
-        }
-        MPI_Put(&cmd, 1, MPI_UNSIGNED_LONG_LONG,
-                trgComm, hdrDisp + offsetof(PackedQueueHeader, stop_cmd), 1, MPI_UNSIGNED_LONG_LONG, m_window);
-        MPI_Put(&ver, 1, MPI_UNSIGNED_LONG_LONG,
-                trgComm, hdrDisp + offsetof(PackedQueueHeader, stop_cmd_ver), 1, MPI_UNSIGNED_LONG_LONG, m_window);
-        MPI_Win_flush(trgComm, m_window);
-        if (!m_lockedAll) {
-            MPI_Win_unlock(trgComm, m_window);
-        }
-        ++ok;
-    }
-
-    // Always-on diagnostic: STOP_CMD mailbox publish summary.
-    size_t crossCount = 0;
-    for (int trg : agentRanks) {
-        if (m_crossAgentRanks.find(trg) != m_crossAgentRanks.end()) ++crossCount;
-    }
-    std::cout << "[STOP_MAILBOX][CMD_PUB] kernel=" << m_rank
-              << " targets=" << agentRanks.size()
-              << " ok=" << ok
-              << " skipNotInComm=" << skipNotInComm
-              << " skipTooSmall=" << skipTooSmall
-              << " crossTargets=" << crossCount
-              << " ver=" << ver
-              << std::endl;
-    if (!skippedNotInComm.empty()) {
-        std::cout << "[STOP_MAILBOX][CMD_PUB_SKIP_NOT_IN_COMM] kernel=" << m_rank << " ranks={";
-        for (size_t i = 0; i < skippedNotInComm.size(); ++i) {
-            std::cout << skippedNotInComm[i] << (i + 1 < skippedNotInComm.size() ? "," : "");
-        }
-        std::cout << "}" << std::endl;
-    }
-    if (!skippedTooSmall.empty()) {
-        std::cout << "[STOP_MAILBOX][CMD_PUB_SKIP_TOO_SMALL] kernel=" << m_rank << " ranks={";
-        for (size_t i = 0; i < skippedTooSmall.size(); ++i) {
-            std::cout << skippedTooSmall[i] << (i + 1 < skippedTooSmall.size() ? "," : "");
-        }
-        std::cout << "}" << std::endl;
-    }
-}
-
-MPICommunicationManager::StopMailboxSnapshot MPICommunicationManager::snapshotStopMailboxLocal() {
-    StopMailboxSnapshot out;
-    if (!m_useRMA || m_window == MPI_WIN_NULL || m_buffer == nullptr) {
-        return out;
-    }
-    if (!m_isUnifiedModel) {
-        MPI_Win_sync(m_window);
-    }
-    out.slices = m_sliceCount;
-    for (size_t idx = 0; idx < m_sliceCount; ++idx) {
-        auto* hdr = localQueueHeaderByIndex(idx);
-        // cmd
-        uint64_t cv1 = hdr->stop_cmd_ver;
-        if (cv1 != 0) {
-            uint64_t cmd = hdr->stop_cmd;
-            uint64_t cv2 = hdr->stop_cmd_ver;
-            if (cv1 == cv2) {
-                out.stopCmdVerNonZero += 1;
-                if (cmd == 1) out.stopCmdIsStop += 1;
-                if (cv2 > out.stopCmdMaxVer) out.stopCmdMaxVer = cv2;
-            }
-        }
-        // state
-        uint64_t sv1 = hdr->stop_ver;
-        if (sv1 != 0) {
-            uint64_t st = hdr->stop_state;
-            uint64_t sv2 = hdr->stop_ver;
-            if (sv1 == sv2) {
-                out.stopStateVerNonZero += 1;
-                if (st == 2) out.stopStateIsStopped += 1;
-                if (sv2 > out.stopStateMaxVer) out.stopStateMaxVer = sv2;
-            }
-        }
-    }
-    return out;
 }
 
 std::vector<char> MPICommunicationManager::serializeMessage(const DistributedMessage& msg) {
@@ -1997,6 +2101,8 @@ void MPICommunicationManager::enableRMAMode(size_t bufferSizeBytes) {
 void MPICommunicationManager::enableRMAMode(size_t bufferSizeBytes, int simulationRank, const std::vector<int>& agentRanks) {
     m_simulationRank = simulationRank;
     m_agentRanks = agentRanks;
+    invalidateRemoteLayoutCaches("enable_rma_topology");
+    rebuildRemoteLayoutCaches();
     m_localWindowSizeBytes = bufferSizeBytes;
     if (m_size <= 1) { std::cout << "Single process mode, RMA not enabled" << std::endl; return; }
     if (m_useRMA) { std::cout << "RMA mode already enabled on rank " << m_rank << std::endl; return; }
@@ -2017,6 +2123,8 @@ void MPICommunicationManager::enableRMAMode(int simulationRank, const std::vecto
 void MPICommunicationManager::setRemoteWindowLayout(size_t remoteKernelBytes, size_t remoteAgentBytes) {
     m_remoteKernelWindowSizeBytes = remoteKernelBytes;
     m_remoteAgentWindowSizeBytes = remoteAgentBytes;
+    invalidateRemoteLayoutCaches("set_remote_window_layout");
+    rebuildRemoteLayoutCaches();
 }
 
 void MPICommunicationManager::enableRMAModeMultiTopologies(const std::vector<int>& kernelRanks,
@@ -2028,6 +2136,8 @@ void MPICommunicationManager::enableRMAModeMultiTopologies(const std::vector<int
     m_kernelTargets.clear();
     for (int kr : kernelRanks) m_kernelTargets.insert(kr);
     m_agentRanksByKernel = agentRanksByKernel;
+    invalidateRemoteLayoutCaches("enable_rma_multi_topologies");
+    rebuildRemoteLayoutCaches();
     do {
         static bool printedTopo = false;
         if (!printedTopo) {
@@ -2050,6 +2160,8 @@ void MPICommunicationManager::enableRMAModeMultiTopologies(const std::vector<int
 
 void MPICommunicationManager::setRemoteWindowLayoutForKernels(const std::unordered_map<int, size_t>& remoteKernelBytesByKernel) {
     m_remoteKernelWindowSizeByKernel = remoteKernelBytesByKernel;
+    invalidateRemoteLayoutCaches("set_remote_window_layout_for_kernels");
+    rebuildRemoteLayoutCaches();
 }
 
 bool MPICommunicationManager::initializeRMAWindow(size_t bufferSize) {
@@ -2172,10 +2284,6 @@ bool MPICommunicationManager::initializeRMAWindow(size_t bufferSize) {
         hdr->lbts_ver = 0;
         hdr->g_value = 0;
         hdr->g_ver = 0;
-        hdr->stop_state = 0;
-        hdr->stop_ver = 0;
-        hdr->stop_cmd = 0;
-        hdr->stop_cmd_ver = 0;
     }
 
     // IMPORTANT: the communicator used to create the window defines the rank numbering for all RMA ops.
@@ -2223,25 +2331,36 @@ bool MPICommunicationManager::initializeRMAWindow(size_t bufferSize) {
     } else {
         m_isUnifiedModel = false;
     }
+    if (m_lockAllRequested && !m_lockedAll) {
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, m_window);
+        m_lockedAll = true;
+    }
 
     m_lastLbtsVerBySlice.assign(m_sliceCount, 0);
     m_lastStopCmdVerBySlice.assign(m_sliceCount, 0);
-    
-    std::cout << "RMA window initialized on rank " << m_rank
-              << ": total=" << m_bufferSize
-              << ", sliceCount=" << m_sliceCount
-              << ", regionBytesPerSlice=" << m_perQueueRegionBytes
-              << ", ringCapacityPerSlice=" << m_perQueueCapacityBytes
-              << ", model=" << (m_isUnifiedModel ? "UNIFIED" : "SEPARATE")
+
+    int windowCommSize = -1;
+    if (m_windowComm != MPI_COMM_NULL) {
+        MPI_Comm_size(m_windowComm, &windowCommSize);
+    }
+    std::cout << "[RMA][WIN_INIT] rank=" << m_rank
+              << " total=" << m_bufferSize
+              << " sliceCount=" << m_sliceCount
+              << " regionBytesPerSlice=" << m_perQueueRegionBytes
+              << " ringCapacityPerSlice=" << m_perQueueCapacityBytes
+              << " model=" << (m_isUnifiedModel ? "UNIFIED" : "SEPARATE")
+              << " lockedAll=" << (m_lockedAll ? 1 : 0)
+              << " windowCommIsWorld=" << (m_windowCommIsWorld ? 1 : 0)
+              << " windowCommSize=" << windowCommSize
               << std::endl;
     return true;
 }
 
-void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRank) {
-    rmaPut(data, targetRank, 0);
+void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRank, const DistributedMessage* msgContext) {
+    rmaPut(data, targetRank, 0, msgContext);
 }
 
-void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRank, uint32_t seq) {
+void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRank, uint32_t seq, const DistributedMessage* msgContext) {
     // During quiesce/shutdown, abort quickly to avoid deadlocks in the RMA ring backpressure loop.
     if (m_abortRmaPuts.load(std::memory_order_acquire) || !m_running.load(std::memory_order_relaxed)) {
         return;
@@ -2259,113 +2378,71 @@ void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRa
     };
     const bool diagStopAck = isAckStoppedPayload();
 
-    size_t sliceIndex;
     bool targetIsKernel = (targetRank == m_simulationRank) || (m_kernelTargets.find(targetRank) != m_kernelTargets.end());
-    std::vector<int> targetAgentRanks;
+    RemoteWindowLayout layout;
     if (targetIsKernel) {
-        auto itAR = m_agentRanksByKernel.find(targetRank);
-        if (itAR != m_agentRanksByKernel.end()) {
-            targetAgentRanks = itAR->second;
-        } else if (targetRank == m_simulationRank) {
-            targetAgentRanks = m_agentRanks;
-        }
-        auto itCross = m_crossAgentRanksByKernel.find(targetRank);
-        if (itCross != m_crossAgentRanksByKernel.end()) {
-            for (int cr : itCross->second) {
-                targetAgentRanks.push_back(cr);
-            }
-            std::sort(targetAgentRanks.begin(), targetAgentRanks.end());
-            targetAgentRanks.erase(std::unique(targetAgentRanks.begin(), targetAgentRanks.end()), targetAgentRanks.end());
-        }
-        if (targetAgentRanks.empty()) {
+        if (!computeRemoteKernelWindowLayoutForAgent(targetRank, m_rank, layout)) {
             if (diagStopAck) {
                 std::cout << "[STOP_ACK][RMA_DROP] origin=" << m_rank
                           << " targetKernel=" << targetRank
-                          << " reason=targetAgentRanksEmpty"
+                          << " reason=remoteKernelLayoutUnavailable"
+                          << " layoutSource=" << layout.source
                           << std::endl;
             }
-            return;
-        }
-        auto itPos = std::find(targetAgentRanks.begin(), targetAgentRanks.end(), m_rank);
-        if (itPos == targetAgentRanks.end()) {
-            if (diagStopAck) {
-                int mn = targetAgentRanks.empty() ? -1 : *std::min_element(targetAgentRanks.begin(), targetAgentRanks.end());
-                int mx = targetAgentRanks.empty() ? -1 : *std::max_element(targetAgentRanks.begin(), targetAgentRanks.end());
-                std::cout << "[STOP_ACK][RMA_DROP] origin=" << m_rank
-                          << " targetKernel=" << targetRank
-                          << " reason=originNotInTargetAgentRanks"
-                          << " targetListSize=" << targetAgentRanks.size()
-                          << " min=" << mn << " max=" << mx
-                          << std::endl;
-            }
-            return;
-        }
-        sliceIndex = static_cast<size_t>(std::distance(targetAgentRanks.begin(), itPos));
-    } else {
-        if (m_crossAgentRanks.find(targetRank) != m_crossAgentRanks.end() && !m_kernelTargets.empty()) {
-            std::vector<int> kernels;
-            auto topoIt = m_crossAgentWindowTopology.find(targetRank);
-            if (topoIt != m_crossAgentWindowTopology.end()) {
-                kernels = topoIt->second;
-                auto it = std::find(kernels.begin(), kernels.end(), m_rank);
-                if (it == kernels.end()) {
-                    // static std::unordered_set<int> warned;
-                    // if (warned.find(targetRank) == warned.end()) {
-                    //     std::cout << "[RMA][SKIP] rank=" << m_rank << " skip sending to crossAgent=" << targetRank 
-                    //               << " (not in senders)" << std::endl;
-                    //     warned.insert(targetRank);
-                    // }
-                    return;
-                }
-            } else {
-                kernels.assign(m_kernelTargets.begin(), m_kernelTargets.end());
-            }
-            std::sort(kernels.begin(), kernels.end());
-            auto it = std::lower_bound(kernels.begin(), kernels.end(), m_rank);
-            if (it != kernels.end() && *it == m_rank) {
-                sliceIndex = static_cast<size_t>(std::distance(kernels.begin(), it));
-                // if (payloadBytes < 500) {  // START消息很小
-                //     static int sendCount = 0;
-                //     if (sendCount++ < 20) {
-                //         std::cout << "[RMA][SEND_CROSS] rank=" << m_rank << " -> crossAgent=" << targetRank 
-                //                   << " sliceIdx=" << sliceIndex << " mySenders=" << kernels.size() 
-                //                   << " bytes=" << payloadBytes << std::endl;
-                //     }
-                // }
-            } else {
-                std::cout << "[RMA][ERROR] rank=" << m_rank << " not found in sorted senders for crossAgent=" << targetRank << std::endl;
+            if (isBroadcastLikeMessage(msgContext)) {
                 return;
             }
-        } else {
-            sliceIndex = 0;
-        }
-    }
-    // std::cout << "[rmaPut] originRank=" << m_rank
-    //           << " targetRank=" << targetRank
-    //           << " sliceIndex=" << sliceIndex
-    //           << " payloadBytes=" << payloadBytes
-    //           << std::endl;
-    const size_t headerBytes = sizeof(PackedQueueHeader);
-    size_t remoteSliceCount;
-    size_t remoteWindowBytes;
-    if (targetIsKernel) {
-        remoteSliceCount = targetAgentRanks.size();
-        auto itW = m_remoteKernelWindowSizeByKernel.find(targetRank);
-        remoteWindowBytes = (itW != m_remoteKernelWindowSizeByKernel.end()) ? itW->second : m_remoteKernelWindowSizeBytes;
-    } else {
-        if (m_crossAgentRanks.find(targetRank) != m_crossAgentRanks.end() && !m_kernelTargets.empty()) {
-            auto topoIt = m_crossAgentWindowTopology.find(targetRank);
-            if (topoIt != m_crossAgentWindowTopology.end()) {
-                remoteSliceCount = topoIt->second.size();
-            } else {
-                remoteSliceCount = m_kernelTargets.size();
+            static std::mutex s_mu;
+            static std::unordered_set<uint64_t> s_seen;
+            const uint64_t key = (uint64_t)((uint32_t)m_rank) << 32 | (uint32_t)targetRank;
+            bool first = false;
+            { std::lock_guard<std::mutex> lk(s_mu); first = s_seen.insert(key).second; }
+            if (first) {
+                std::cerr << "[RMA][DROP] origin=" << m_rank
+                          << " target=" << targetRank
+                          << " targetIsKernel=1"
+                          << " reason=remoteKernelLayoutUnavailable"
+                          << " layoutSource=" << layout.source
+                          << std::endl;
             }
-        } else {
-            remoteSliceCount = 1;
+            return;
         }
-        remoteWindowBytes = m_remoteAgentWindowSizeBytes;
+    } else {
+        if (!computeRemoteAgentWindowLayoutForKernel(targetRank, m_rank, layout)) {
+            if (diagStopAck) {
+                std::cout << "[STOP_ACK][RMA_DROP] origin=" << m_rank
+                          << " target=" << targetRank
+                          << " reason=remoteAgentLayoutUnavailable"
+                          << " isCrossTarget=" << (layout.isCrossTarget ? 1 : 0)
+                          << " layoutSource=" << layout.source
+                          << std::endl;
+            }
+            if (isBroadcastLikeMessage(msgContext)) {
+                return;
+            }
+            static std::mutex s_mu;
+            static std::unordered_set<uint64_t> s_seen;
+            const uint64_t key = (uint64_t)((uint32_t)m_rank) << 32 | (uint32_t)targetRank;
+            bool first = false;
+            { std::lock_guard<std::mutex> lk(s_mu); first = s_seen.insert(key).second; }
+            if (first) {
+                std::cerr << "[RMA][DROP] origin=" << m_rank
+                          << " target=" << targetRank
+                          << " targetIsKernel=0"
+                          << " isCrossTarget=" << (layout.isCrossTarget ? 1 : 0)
+                          << " reason=remoteAgentLayoutUnavailable"
+                          << " layoutSource=" << layout.source
+                          << std::endl;
+            }
+            return;
+        }
     }
-    size_t remotePerRegionBytes = compute_aligned_region_bytes(remoteWindowBytes, remoteSliceCount);
+
+    const size_t sliceIndex = layout.sliceIndex;
+    const size_t headerBytes = sizeof(PackedQueueHeader);
+    const size_t remoteSliceCount = layout.sliceCount;
+    const size_t remoteWindowBytes = layout.windowBytes;
+    const size_t remotePerRegionBytes = layout.perRegionBytes;
     size_t remotePerCapacityBytes = (remotePerRegionBytes > headerBytes)
                                     ? (remotePerRegionBytes - headerBytes)
                                     : 0;
@@ -2398,8 +2475,8 @@ void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRa
         return;
     }
 
-    const size_t regionOffset = sliceIndex * remotePerRegionBytes;
-    const MPI_Aint hdrDisp = static_cast<MPI_Aint>(regionOffset);
+    const MPI_Aint hdrDisp = layout.headerDisp;
+    const size_t regionOffset = static_cast<size_t>(hdrDisp);
     const MPI_Aint ringDisp = static_cast<MPI_Aint>(regionOffset + headerBytes);
 
     do {
@@ -2409,6 +2486,7 @@ void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRa
             std::cout << "[RMA][TRACE] originRank=" << m_rank
                       << " -> targetRank=" << targetRank
                       << " toKernel=" << (toKernel?"true":"false")
+                      << " layoutSource=" << layout.source
                       << " remoteWindowBytes=" << remoteWindowBytes
                       << " remoteSliceCount=" << remoteSliceCount
                       << " perRegionBytes=" << remotePerRegionBytes
@@ -2423,6 +2501,9 @@ void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRa
     const int targetComm = toWinCommRank(targetRank);
     if (targetComm < 0) {
         // Always-on diagnostic: dropping an RMA send due to target not in window communicator.
+        if (isBroadcastLikeMessage(msgContext)) {
+            return;
+        }
         std::cerr << "[RMA][DROP] origin=" << m_rank
                   << " target=" << targetRank
                   << " reason=toWinCommRankInvalid"
@@ -2437,6 +2518,7 @@ void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRa
         std::cout << "[STOP_ACK][RMA_SEND] origin=" << m_rank
                   << " target=" << targetRank
                   << " toKernel=" << (targetIsKernel ? "true" : "false")
+                  << " lockedAll=" << (m_lockedAll ? 1 : 0)
                   << " sliceIndex=" << sliceIndex
                   << " remoteSliceCount=" << remoteSliceCount
                   << " remoteWindowBytes=" << remoteWindowBytes
@@ -2563,6 +2645,9 @@ void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRa
                 targetComm, hdrDisp + offsetof(PackedQueueHeader, lbts_ver), 1, MPI_UNSIGNED_LONG_LONG, m_window);
     }
     MPI_Win_flush(targetComm, m_window);
+    if (isMainDoorbellEnabled()) {
+        sendDoorbellNotify(targetRank, MAIN_DOORBELL_TAG, "MAIN");
+    }
     if (m_enableRMAStats) {
         std::lock_guard<std::mutex> lk(m_rmaStatsMutex);
         m_rmaStats.putCount++;
@@ -2587,7 +2672,7 @@ void MPICommunicationManager::rmaPut(const std::vector<char>& data, int targetRa
 
 bool MPICommunicationManager::isControlMessageType(const std::string& type) {
     // These message types are safety-critical for startup/teardown; keep them on a higher-priority tag.
-    if (type == "EVENT_SIMULATION_START" || type == "EVENT_SIMULATION_STOP") return true;
+    if (type == "EVENT_SIMULATION_START" || type == "EVENT_SIMULATION_STOP" || type == "EVENT_SHUTDOWN_STOP") return true;
     if (type == "AGENT_RANK_READY") return true;
     if (type == "WAKEUP" || type == "WAKEUP_FOR_IMPACT" || type == "WAKEUP_FOR_REPLAY") return true;
     if (type == "ACK_ENQUEUED") return true;
@@ -2647,8 +2732,12 @@ std::vector<std::shared_ptr<DistributedMessage>> MPICommunicationManager::checkT
 #endif
         }
     };
+    // MAIN_CTRL_TAG is always polled because AGENT_RANK_READY is forced onto the
+    // two-sided control path even when the main/bulk transport remains RMA.
     drainTag(MAIN_CTRL_TAG);
-    drainTag(MAIN_MSG_TAG);
+    if (m_mainCommMode == MainCommMode::TWO_SIDED) {
+        drainTag(MAIN_MSG_TAG);
+    }
     return out;
 }
 
@@ -2849,9 +2938,8 @@ uint64_t MPICommunicationManager::getMinKernelGlobalLBTSFromTwoSidedCache() {
 std::vector<std::shared_ptr<DistributedMessage>> MPICommunicationManager::checkRMAMessages() {
     std::vector<std::shared_ptr<DistributedMessage>> messages;
     
-    if (m_useRMA && m_window != MPI_WIN_NULL) {
-        MPI_Win_sync(m_window);
-    }
+    // For SEPARATE memory model, refresh once per polling pass before scanning all slices.
+    const int localEpoch = (m_useRMA && m_window != MPI_WIN_NULL) ? beginMainWindowLocalAccess(true) : -1;
 
 
     for (size_t idx = 0; idx < m_sliceCount; ++idx) {
@@ -2909,45 +2997,21 @@ std::vector<std::shared_ptr<DistributedMessage>> MPICommunicationManager::checkR
                     //     }
                     // }
                 }
-                if (msg->type == "ACK_STOPPED") {
-                    int claimed = (idx < m_sliceSenderRanks.size()) ? m_sliceSenderRanks[idx] : -1;
-                    std::cout << "[STOP_ACK][RMA_RECV] rank=" << m_rank
-                              << " sliceIdx=" << idx
-                              << " claimedSender=" << claimed
-                              << " bytes=" << len
-                              << std::endl;
-                }
                 messages.push_back(msg);
             }
         }
 
         hdr->head = head;
-        if (m_useRMA && m_window != MPI_WIN_NULL) {
-            MPI_Win_sync(m_window);
-        }
     }
 
+    endMainWindowLocalAccess(localEpoch, true);
     return messages;
 }
 
-bool MPICommunicationManager::doorbellAnyChangedAndUpdateCache() {
-    // If doorbell is disabled, do not touch any doorbell-adjacent state (including MPI_Win_sync here).
-    if (m_doorbellMode == DoorbellMode::DISABLED) return false;
-    if (!m_useRMA || m_window == MPI_WIN_NULL) return false;
-    if (m_rank != m_simulationRank) return false;
-    if (!m_isUnifiedModel) {
-        MPI_Win_sync(m_window);
-    }
-    bool changed = false;
-    for (size_t idx = 0; idx < m_sliceCount; ++idx) {
-        auto* hdr = localQueueHeaderByIndex(idx);
-        uint64_t v = hdr->lbts_ver;
-        if (v != m_lastLbtsVerBySlice[idx]) {
-            m_lastLbtsVerBySlice[idx] = v;
-            changed = true;
-        }
-    }
-    return changed;
+bool MPICommunicationManager::syncDoorbellAnyChangedAndUpdateCache() {
+    // If sync doorbell is disabled, do not touch any sync-doorbell-adjacent state (including MPI_Win_sync here).
+    if (!isSyncDoorbellEnabled()) return false;
+    return snapshotAgentLbtsWindow(true).changed;
 }
 
 bool MPICommunicationManager::initializeKernelClockWindow(int worldSize) {
@@ -2992,12 +3056,17 @@ bool MPICommunicationManager::initializeKernelClockWindow(int worldSize) {
     int flag = 0; int model = 0;
     MPI_Win_get_attr(m_kernelClockWin, MPI_WIN_MODEL, &model, &flag);
     m_kernelClockUnifiedModel = (flag && model == MPI_WIN_UNIFIED);
-    MPI_Win_lock_all(MPI_MODE_NOCHECK, m_kernelClockWin);
-    m_kernelClockLockedAll = true;
+    if (m_lockAllRequested) {
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, m_kernelClockWin);
+        m_kernelClockLockedAll = true;
+    } else {
+        m_kernelClockLockedAll = false;
+    }
     std::cout << "[KCOMM][CLOCK] rank=" << m_rank
               << " model=" << (m_kernelClockUnifiedModel?"UNIFIED":"SEPARATE")
               << " win_bytes=" << m_kernelClockBytes
               << " via=" << (m_commKernels!=MPI_COMM_NULL?"KComm":"WORLD")
+              << " lockedAll=" << (m_kernelClockLockedAll ? 1 : 0)
               << std::endl;
     return true;
 }
@@ -3042,6 +3111,9 @@ void MPICommunicationManager::publishKernelClockToPeers(uint64_t time, uint32_t 
             if (it == m_kcommRankOfGlobal.end()) continue;
             int trg = it->second;
             if (trg == senderIndex) continue;
+            if (!m_kernelClockLockedAll) {
+                MPI_Win_lock(MPI_LOCK_EXCLUSIVE, trg, 0, m_kernelClockWin);
+            }
             MPI_Put(&tmp.time, 1, MPI_UNSIGNED_LONG_LONG,
                     trg, disp + offsetof(KernelClockState, time),
                     1, MPI_UNSIGNED_LONG_LONG, m_kernelClockWin);
@@ -3049,6 +3121,9 @@ void MPICommunicationManager::publishKernelClockToPeers(uint64_t time, uint32_t 
                     trg, disp + offsetof(KernelClockState, epoch),
                     1, MPI_UNSIGNED, m_kernelClockWin);
             MPI_Win_flush(trg, m_kernelClockWin);
+            if (!m_kernelClockLockedAll) {
+                MPI_Win_unlock(trg, m_kernelClockWin);
+            }
         }
         static bool printedOnce = false;
         if (!printedOnce) {
@@ -3059,13 +3134,19 @@ void MPICommunicationManager::publishKernelClockToPeers(uint64_t time, uint32_t 
             std::cout << "}" << std::endl; printedOnce = true;
         }
     } else {
+        KernelClockState tmp{time, epoch, 0u};
         for (int kr : kernelRanks) {
             if (kr == m_rank) continue;
+            if (!m_kernelClockLockedAll) {
+                MPI_Win_lock(MPI_LOCK_EXCLUSIVE, kr, 0, m_kernelClockWin);
+            }
             MPI_Aint disp = static_cast<MPI_Aint>(m_rank * sizeof(KernelClockState));
-            KernelClockState tmp{time, epoch, 0u};
             MPI_Put(&tmp.time, 1, MPI_UNSIGNED_LONG_LONG, kr, disp + offsetof(KernelClockState, time), 1, MPI_UNSIGNED_LONG_LONG, m_kernelClockWin);
             MPI_Put(&tmp.epoch, 1, MPI_UNSIGNED, kr, disp + offsetof(KernelClockState, epoch), 1, MPI_UNSIGNED, m_kernelClockWin);
             MPI_Win_flush(kr, m_kernelClockWin);
+            if (!m_kernelClockLockedAll) {
+                MPI_Win_unlock(kr, m_kernelClockWin);
+            }
         }
         static bool printedOnce2 = false;
         if (!printedOnce2) {
@@ -3077,71 +3158,37 @@ void MPICommunicationManager::publishKernelClockToPeers(uint64_t time, uint32_t 
 }
 
 uint64_t MPICommunicationManager::getMinKernelClockFromLocalWindow(const std::vector<int>& kernelRanks) {
-    if (m_lbtsSyncMode == LBTSSyncMode::TWO_SIDED) {
-        uint64_t gmin = UINT64_MAX;
-        bool anyMissing = false;
-        std::lock_guard<std::mutex> lk(m_twoSidedKernelClockMutex);
-        for (int kr : kernelRanks) {
-            if (kr < 0 || kr == m_rank) continue;
-            auto it = m_twoSidedKernelClockBySender.find(kr);
-            if (it == m_twoSidedKernelClockBySender.end()) { anyMissing = true; continue; }
-            const KernelClockState& st = it->second;
-            if (st.epoch == 0u) { anyMissing = true; continue; }
-            if (st.time < gmin) gmin = st.time;
-        }
-        if (anyMissing) return 0ull;
-        return gmin;
-    }
-    if (m_kernelClockWin == MPI_WIN_NULL) return UINT64_MAX;
-    if (!m_kernelClockUnifiedModel) {
-        MPI_Win_sync(m_kernelClockWin);
-    }
-    
-    uint64_t gmin = UINT64_MAX; bool anyMissing = false;
-    if (m_commKernels != MPI_COMM_NULL) {
-        for (int kr : kernelRanks) {
-            if (kr == m_rank) continue;
-            auto it = m_kcommRankOfGlobal.find(kr);
-            if (it == m_kcommRankOfGlobal.end()) continue;
-            int idx = it->second;
-            const KernelClockState& st = m_kernelClockBuf[idx];
-            if (st.epoch == 0u) { anyMissing = true; continue; }
-            if (st.time < gmin) gmin = st.time;
-        }
-    } else {
-        for (int kr : kernelRanks) {
-            if (kr == m_rank) continue;
-            const KernelClockState& st = m_kernelClockBuf[kr];
-            if (st.epoch == 0u) { anyMissing = true; continue; }
-            if (st.time < gmin) gmin = st.time;
-        }
-    }
-    
-    if (anyMissing) return 0ull;
-    return gmin;
+    return snapshotKernelClockWindow(kernelRanks).minKernelClock;
 }
 
-std::unordered_map<int, uint64_t> MPICommunicationManager::getKernelClocksForRanks(const std::vector<int>& kernelRanks) {
-    std::unordered_map<int, uint64_t> out;
+MPICommunicationManager::KernelClockWindowSnapshot MPICommunicationManager::snapshotKernelClockWindow(const std::vector<int>& kernelRanks) {
+    KernelClockWindowSnapshot snapshot;
     if (m_lbtsSyncMode == LBTSSyncMode::TWO_SIDED) {
         std::lock_guard<std::mutex> lk(m_twoSidedKernelClockMutex);
         for (int kr : kernelRanks) {
             if (kr < 0 || kr == m_rank) continue;
             auto it = m_twoSidedKernelClockBySender.find(kr);
             if (it == m_twoSidedKernelClockBySender.end() || it->second.epoch == 0u) {
-                out[kr] = 0ull;
+                snapshot.perKernelClock[kr] = 0ull;
             } else {
-                out[kr] = it->second.time;
+                snapshot.perKernelClock[kr] = it->second.time;
             }
         }
-        return out;
+        bool anyMissing = false;
+        uint64_t gmin = UINT64_MAX;
+        for (const auto& kv : snapshot.perKernelClock) {
+            if (kv.second == 0ull) { anyMissing = true; continue; }
+            if (kv.second < gmin) gmin = kv.second;
+        }
+        snapshot.minKernelClock = anyMissing ? 0ull : gmin;
+        return snapshot;
     }
     if (m_kernelClockWin == MPI_WIN_NULL || m_kernelClockBuf == nullptr || kernelRanks.empty()) {
-        return out;
+        return snapshot;
     }
-    if (!m_kernelClockUnifiedModel) {
-        MPI_Win_sync(m_kernelClockWin);
-    }
+    const int localEpoch = beginKernelClockLocalAccess(false);
+    bool anyMissing = false;
+    uint64_t gmin = UINT64_MAX;
     if (m_commKernels != MPI_COMM_NULL) {
         for (int kr : kernelRanks) {
             if (kr == m_rank) continue;
@@ -3150,9 +3197,11 @@ std::unordered_map<int, uint64_t> MPICommunicationManager::getKernelClocksForRan
             int idx = it->second;
             const KernelClockState& st = m_kernelClockBuf[idx];
             if (st.epoch == 0u) {
-                out[kr] = 0ull; // missing
+                snapshot.perKernelClock[kr] = 0ull; // missing
+                anyMissing = true;
             } else {
-                out[kr] = st.time;
+                snapshot.perKernelClock[kr] = st.time;
+                if (st.time < gmin) gmin = st.time;
             }
         }
     } else {
@@ -3160,13 +3209,21 @@ std::unordered_map<int, uint64_t> MPICommunicationManager::getKernelClocksForRan
             if (kr == m_rank) continue;
             const KernelClockState& st = m_kernelClockBuf[kr];
             if (st.epoch == 0u) {
-                out[kr] = 0ull;
+                snapshot.perKernelClock[kr] = 0ull;
+                anyMissing = true;
             } else {
-                out[kr] = st.time;
+                snapshot.perKernelClock[kr] = st.time;
+                if (st.time < gmin) gmin = st.time;
             }
         }
     }
-    return out;
+    snapshot.minKernelClock = anyMissing ? 0ull : gmin;
+    endKernelClockLocalAccess(localEpoch, false);
+    return snapshot;
+}
+
+std::unordered_map<int, uint64_t> MPICommunicationManager::getKernelClocksForRanks(const std::vector<int>& kernelRanks) {
+    return snapshotKernelClockWindow(kernelRanks).perKernelClock;
 }
 
 bool MPICommunicationManager::allKernelEpochsAtLeast(uint32_t minEpoch, const std::vector<int>& kernelRanks) {
@@ -3181,23 +3238,29 @@ bool MPICommunicationManager::allKernelEpochsAtLeast(uint32_t minEpoch, const st
         return true;
     }
     if (m_kernelClockWin == MPI_WIN_NULL) return false;
-    if (!m_kernelClockUnifiedModel) {
-        MPI_Win_sync(m_kernelClockWin);
-    }
+    const int localEpoch = beginKernelClockLocalAccess(false);
     if (m_commKernels != MPI_COMM_NULL) {
         for (int kr : kernelRanks) {
             if (kr == m_rank) continue;
             auto it = m_kcommRankOfGlobal.find(kr);
             if (it == m_kcommRankOfGlobal.end()) continue;
             int idx = it->second;
-            if (m_kernelClockBuf[idx].epoch < minEpoch) return false;
+            if (m_kernelClockBuf[idx].epoch < minEpoch) {
+                endKernelClockLocalAccess(localEpoch, false);
+                return false;
+            }
         }
+        endKernelClockLocalAccess(localEpoch, false);
         return true;
     } else {
         for (int kr : kernelRanks) {
             if (kr == m_rank) continue;
-            if (m_kernelClockBuf[kr].epoch < minEpoch) return false;
+            if (m_kernelClockBuf[kr].epoch < minEpoch) {
+                endKernelClockLocalAccess(localEpoch, false);
+                return false;
+            }
         }
+        endKernelClockLocalAccess(localEpoch, false);
         return true;
     }
 }
@@ -3226,7 +3289,7 @@ void MPICommunicationManager::createKernelOnlyCommunicator(const std::vector<int
     std::vector<int> ranksIncl = kernelRanks;
     MPI_Group kGroup; MPI_Group_incl(worldGroup, (int)ranksIncl.size(), ranksIncl.data(), &kGroup);
     MPI_Comm newComm = MPI_COMM_NULL;
-    MPI_Comm_create_group(MPI_COMM_WORLD, kGroup, 0, &newComm);
+    MPI_Comm_create_group(MPI_COMM_WORLD, kGroup, KERNEL_COMM_CREATE_TAG, &newComm);
     MPI_Group_free(&kGroup); MPI_Group_free(&worldGroup);
     m_commKernels = newComm;
     if (m_commKernels != MPI_COMM_NULL) {
@@ -3261,7 +3324,7 @@ void MPICommunicationManager::createKernelsCrossCommunicator(const std::vector<i
     MPI_Group worldGroup; MPI_Comm_group(MPI_COMM_WORLD, &worldGroup);
     MPI_Group kxGroup; MPI_Group_incl(worldGroup, (int)ranksIncl.size(), ranksIncl.data(), &kxGroup);
     MPI_Comm newComm = MPI_COMM_NULL;
-    MPI_Comm_create_group(MPI_COMM_WORLD, kxGroup, 0, &newComm);
+    MPI_Comm_create_group(MPI_COMM_WORLD, kxGroup, KERNELS_CROSS_COMM_CREATE_TAG, &newComm);
     MPI_Group_free(&kxGroup); MPI_Group_free(&worldGroup);
     m_commKernelsCross = newComm;
     if (m_commKernelsCross != MPI_COMM_NULL) {
@@ -3289,7 +3352,7 @@ void MPICommunicationManager::createKernelsCrossCommunicator(const std::vector<i
 void MPICommunicationManager::destroySubCommunicators() {
     if (m_commKernels != MPI_COMM_NULL) { MPI_Comm_free(&m_commKernels); m_commKernels = MPI_COMM_NULL; }
     if (m_commKernelAgents != MPI_COMM_NULL) { MPI_Comm_free(&m_commKernelAgents); m_commKernelAgents = MPI_COMM_NULL; }
-    m_kcommSize = 0; m_kcommRank = -1; m_kcommRankOfGlobal.clear(); m_gcommRankOfGlobal.clear();
+    m_kcommSize = 0; m_kcommRank = -1; m_kcommRankOfGlobal.clear();
 }
 
 void MPICommunicationManager::createLearnerCommunicator(const std::vector<int>& members) {
@@ -3305,7 +3368,16 @@ void MPICommunicationManager::createLearnerCommunicator(const std::vector<int>& 
     MPI_Group worldGroup; MPI_Comm_group(MPI_COMM_WORLD, &worldGroup);
     MPI_Group lGroup; MPI_Group_incl(worldGroup, (int)incl.size(), incl.data(), &lGroup);
     MPI_Comm newComm = MPI_COMM_NULL;
-    MPI_Comm_create_group(MPI_COMM_WORLD, lGroup, 0, &newComm);
+    std::cout << "[LEARNER_COMM][CREATE_ENTER] globalRank=" << m_rank
+              << " members={";
+    for (size_t i = 0; i < incl.size(); ++i) {
+        std::cout << incl[i] << (i + 1 < incl.size() ? "," : "");
+    }
+    std::cout << "} tag=" << LEARNER_COMM_CREATE_TAG << std::endl;
+    MPI_Comm_create_group(MPI_COMM_WORLD, lGroup, LEARNER_COMM_CREATE_TAG, &newComm);
+    std::cout << "[LEARNER_COMM][CREATE_EXIT] globalRank=" << m_rank
+              << " commNull=" << (newComm == MPI_COMM_NULL ? "true" : "false")
+              << " tag=" << LEARNER_COMM_CREATE_TAG << std::endl;
     MPI_Group_free(&lGroup);
     MPI_Group_free(&worldGroup);
     m_commLearner = newComm;

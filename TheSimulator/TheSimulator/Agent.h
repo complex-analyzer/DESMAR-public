@@ -23,6 +23,12 @@ public:
     // without depending on XML tree ancestry.
     virtual void setEpochDate(const std::string& /*yyyymmdd*/) {}
 
+    // Optional final-drain hook (default no-op).
+    // Called after the router has drained inbound messages during shutdown, immediately before
+    // the router reports STOPPED to kernel senders. Agents that persist cross-rank data can use
+    // this to flush records that arrived after EVENT_SIMULATION_STOP was locally delivered.
+    virtual void onFinalDrainCompleted() {}
+
 
 	virtual void configure(const pugi::xml_node& node, const std::string& configurationPath) override;
 protected:
