@@ -7,6 +7,7 @@
 #include <map>
 #include <random>
 #include <algorithm>
+#include <set>
 
 class CppCrossBehavioralSPTAgent : public CppCrossTradingAgent {
 public:
@@ -158,6 +159,7 @@ protected:
 
 private:
     RoundState m_round;
+    std::set<int> m_start_kernels_seen;
     CrossWakeupScheduler m_wakeup_scheduler;
     unsigned int m_scheduler_seed{0};
     double m_wakeup_interval_seconds{1.0};

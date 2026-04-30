@@ -626,6 +626,7 @@ void CppCrossBehavioralSPTAgent::handleSimulationStart() {
         m_wakeup_scheduler.clear();
         m_round.index = 1;
         m_round.in_progress = true;
+        m_start_kernels_seen.clear();
         // In distributed mode, kernel ranks may broadcast START to cross-agent ranks beyond
         // the agent's active tradable basket. To keep synchronization local (and to align
         // with decoupled RMA intent), only count/schedule kernels that correspond to the
@@ -771,6 +772,16 @@ void CppCrossBehavioralSPTAgent::handleWakeup() {
 }
 
 void CppCrossBehavioralSPTAgent::processStartForCurrentKernel() {
+    if (!m_round.in_progress) {
+        if (m_debug_log) {
+            std::cout << "[CrossSPT][StartKernel][Skip] agent=" << name()
+                      << " kernel=" << m_current_kernel
+                      << " reason=start_round_already_finished"
+                      << std::endl;
+        }
+        return;
+    }
+
     // Ignore START messages from kernels that are outside the active universe.
     {
         std::set<int> kernels;
@@ -788,6 +799,15 @@ void CppCrossBehavioralSPTAgent::processStartForCurrentKernel() {
             }
             return;
         }
+    }
+    if (!m_start_kernels_seen.insert(m_current_kernel).second) {
+        if (m_debug_log) {
+            std::cout << "[CrossSPT][StartKernel][Skip] agent=" << name()
+                      << " kernel=" << m_current_kernel
+                      << " reason=duplicate_start_kernel"
+                      << std::endl;
+        }
+        return;
     }
     m_round.ops_done += 1;
     if (m_debug_log) {

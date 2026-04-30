@@ -3093,6 +3093,12 @@ int main(int argc, char* argv[]) {
                     localKernelCrossRanks.erase(std::unique(localKernelCrossRanks.begin(), localKernelCrossRanks.end()),
                                                 localKernelCrossRanks.end());
                 }
+                if (baselineFullMesh) {
+                    localKernelCrossRanks = componentView.crossRanks;
+                    std::sort(localKernelCrossRanks.begin(), localKernelCrossRanks.end());
+                    localKernelCrossRanks.erase(std::unique(localKernelCrossRanks.begin(), localKernelCrossRanks.end()),
+                                                localKernelCrossRanks.end());
+                }
                 if (!localKernelCrossRanks.empty()) {
                     simulation->getCommunication().setCrossAgentRanks(localKernelCrossRanks);
                 }
@@ -3264,10 +3270,17 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 simulation->setRemoteWindowLayout(0, agentWinMB * 1024ull * 1024ull);
-                // In full-mesh mode, componentView.crossAgentSenders already expands each cross rank
-                // to all kernels. Keep the topology explicit so kernel->cross RMA layout is valid.
-                if (!componentView.crossAgentSenders.empty()) {
-                    simulation->getCommunication().setCrossAgentWindowTopology(componentView.crossAgentSenders);
+                auto crossAgentWindowTopology = componentView.crossAgentSenders;
+                if (baselineFullMesh) {
+                    // Full-mesh baseline means every kernel may write to every cross-rank window.
+                    // The target-side RMA slice layout must use the same sender set.
+                    crossAgentWindowTopology.clear();
+                    for (int cr : componentView.crossRanks) {
+                        crossAgentWindowTopology[cr] = componentView.kernelRanks;
+                    }
+                }
+                if (!crossAgentWindowTopology.empty()) {
+                    simulation->getCommunication().setCrossAgentWindowTopology(crossAgentWindowTopology);
                 }
                 bool enableMainDoorbell = false;
                 bool enableSyncDoorbell = true;
@@ -3783,8 +3796,16 @@ int main(int argc, char* argv[]) {
                               << " kernels=" << formatIntList(kernelRanksMulti)
                               << " cross=" << formatIntList(directCrossRanks)
                               << std::endl;
-                    if (!componentView.crossAgentSenders.empty()) {
-                        router->getCommunication().setCrossAgentWindowTopology(componentView.crossAgentSenders);
+                    auto crossAgentWindowTopology = componentView.crossAgentSenders;
+                    if (baselineFullMesh) {
+                        // Keep the cross-rank receive window in sync with the full-mesh sender set.
+                        crossAgentWindowTopology.clear();
+                        for (int cr2 : componentView.crossRanks) {
+                            crossAgentWindowTopology[cr2] = componentView.kernelRanks;
+                        }
+                    }
+                    if (!crossAgentWindowTopology.empty()) {
+                        router->getCommunication().setCrossAgentWindowTopology(crossAgentWindowTopology);
                     }
                     std::vector<int> mergedAgentsB;
                     for (int kr : kernelRanksMulti) {
