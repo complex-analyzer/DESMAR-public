@@ -102,7 +102,7 @@
              - true: enable MPI API-level profiling (thread-safe, supports MPI_THREAD_MULTIPLE)
                      output: communication_logs/mpi_api_profile_rank*.csv (per epoch overwrite; archived by existing log snapshot)
              - false: profiling disabled (no allocations, no statistics recorded) -->
-        <EnableCommunicationTimeStats>false</EnableCommunicationTimeStats>
+        <EnableCommunicationTimeStats>true</EnableCommunicationTimeStats>
 
         <!-- Aligned message time-shift statistics (kernel/agent side controls):
              - EnableAlignedMessageStatsKernel: enable kernel-side aligned message stats (alignment distribution and per-type ratio);

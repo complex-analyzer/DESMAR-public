@@ -105,6 +105,7 @@ void CppMarketMakerAgent::receiveMessage(const MessagePtr& msg) {
         subscribeTradeEvents();
         retrieveL1Data();
         // Bootstrap wakeup very soon after start (SetupAgent may place initial liquidity slightly later).
+        // This is also the seed for the regular wakeup chain; do not schedule another one here.
         {
             std::map<std::string, std::string> empty_payload;
             const_cast<Simulation*>(simulation())->dispatchGenericMessage(
@@ -116,7 +117,6 @@ void CppMarketMakerAgent::receiveMessage(const MessagePtr& msg) {
                 empty_payload
             );
         }
-        scheduleNextWakeup();
 
     }
     else if (type == "RESPONSE_RETRIEVE_L1_DATA") {
